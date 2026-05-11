@@ -13,6 +13,7 @@
 #include <sstream>
 #include <regex>
 #include <deque>
+#include <vector>
 
 #include <boost/circular_buffer.hpp>
 
@@ -108,6 +109,14 @@ namespace {
         if (!tech_pvt->bidirectional_audio_enable || !tech_pvt->playoutBuffer) {
           switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
             "(%u) processIncomingMessage - playAudio received but bidirectional audio is disabled, ignoring\n",
+            tech_pvt->id);
+        }
+        else if (tech_pvt->bidirectional_audio_stream) {
+          // The server picked binary streaming mode; mixing in JSON+base64
+          // playback would interleave incompatible sample rates. Drop with a
+          // warning so the protocol mismatch is visible.
+          switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+            "(%u) processIncomingMessage - playAudio JSON received in binary streaming mode, ignoring\n",
             tech_pvt->id);
         }
         else if (!jsonData) {
@@ -237,7 +246,70 @@ namespace {
     }
   }
 
-  static void eventCallback(const char* sessionId, const char* bugname, AudioPipe::NotifyEvent_t event, const char* message) {
+  /* Handle a chunk of raw L16 PCM that arrived over a WebSocket binary frame.
+   * Steps:
+   *   1. Restitch any odd byte left over from the previous frame so we never
+   *      split an int16_t sample across frame boundaries.
+   *   2. Resample if the server's sample rate differs from the channel's.
+   *   3. Append to the playoutBuffer for dub_speech_frame to drain.
+   * Designed for low latency — each chunk is processed immediately, no
+   * separate prebuffer (the playoutBuffer itself absorbs jitter, and
+   * dub_speech_frame fills silence on underrun). */
+  void processIncomingBinary(private_t* tech_pvt, const char* data, size_t dataLength) {
+    if (!tech_pvt->bidirectional_audio_enable || !tech_pvt->playoutBuffer) return;
+    if (dataLength == 0) return;
+
+    // (1) Reassemble across odd-byte boundaries.
+    std::vector<uint8_t> raw;
+    raw.reserve(dataLength + 1);
+    if (tech_pvt->has_set_aside_byte) {
+      raw.push_back(tech_pvt->set_aside_byte);
+      tech_pvt->has_set_aside_byte = 0;
+    }
+    raw.insert(raw.end(), reinterpret_cast<const uint8_t*>(data),
+                          reinterpret_cast<const uint8_t*>(data) + dataLength);
+    if (raw.size() % 2 != 0) {
+      tech_pvt->set_aside_byte = raw.back();
+      tech_pvt->has_set_aside_byte = 1;
+      raw.pop_back();
+    }
+    if (raw.empty()) return;
+
+    const int16_t* inSamples = reinterpret_cast<const int16_t*>(raw.data());
+    const size_t inSampleCount = raw.size() / sizeof(int16_t);
+
+    // (2) Resample if needed. Otherwise just adopt the buffer directly.
+    std::vector<int16_t> out;
+    if (tech_pvt->bidirectional_audio_resampler) {
+      // Speex max upsampling factor we'd realistically see is 8k → 48k = 6x.
+      out.resize(inSampleCount * 6);
+      spx_uint32_t in_len = static_cast<spx_uint32_t>(inSampleCount);
+      spx_uint32_t out_len = static_cast<spx_uint32_t>(out.size());
+      int err = speex_resampler_process_interleaved_int(
+          tech_pvt->bidirectional_audio_resampler,
+          inSamples, &in_len, out.data(), &out_len);
+      if (err != 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+          "(%u) processIncomingBinary - resampler error: %s\n",
+          tech_pvt->id, speex_resampler_strerror(err));
+        return;
+      }
+      out.resize(out_len);
+    }
+    else {
+      out.assign(inSamples, inSamples + inSampleCount);
+    }
+    if (out.empty()) return;
+
+    // (3) Append under the session mutex.
+    switch_mutex_lock(tech_pvt->mutex);
+    PlayoutBuffer* buf = static_cast<PlayoutBuffer*>(tech_pvt->playoutBuffer);
+    buf->insert(buf->end(), out.begin(), out.end());
+    switch_mutex_unlock(tech_pvt->mutex);
+  }
+
+  static void eventCallback(const char* sessionId, const char* bugname, AudioPipe::NotifyEvent_t event,
+                            const char* message, const char* binary, size_t binary_len) {
     switch_core_session_t* session = switch_core_session_locate(sessionId);
     if (session) {
       switch_channel_t *channel = switch_core_session_get_channel(session);
@@ -279,6 +351,9 @@ namespace {
             case AudioPipe::MESSAGE:
               processIncomingMessage(tech_pvt, session, message);
             break;
+            case AudioPipe::BINARY:
+              processIncomingBinary(tech_pvt, binary, binary_len);
+            break;
           }
         }
       }
@@ -287,7 +362,9 @@ namespace {
   }
   switch_status_t fork_data_init(private_t *tech_pvt, switch_core_session_t *session, char * host,
     unsigned int port, char* path, int sslFlags, int sampling, int desiredSampling, int channels,
-    char *bugname, char* metadata, int bidirectional_audio_enable, responseHandler_t responseHandler) {
+    char *bugname, char* metadata,
+    int bidirectional_audio_enable, int bidirectional_audio_stream, int bidirectional_audio_sample_rate,
+    responseHandler_t responseHandler) {
 
     const char* username = nullptr;
     const char* password = nullptr;
@@ -315,6 +392,11 @@ namespace {
     tech_pvt->audio_paused = 0;
     tech_pvt->graceful_shutdown = 0;
     tech_pvt->bidirectional_audio_enable = bidirectional_audio_enable;
+    tech_pvt->bidirectional_audio_stream = bidirectional_audio_stream;
+    tech_pvt->bidirectional_audio_sample_rate = bidirectional_audio_sample_rate;
+    tech_pvt->bidirectional_audio_resampler = nullptr;
+    tech_pvt->has_set_aside_byte = 0;
+    tech_pvt->set_aside_byte = 0;
     tech_pvt->playoutBuffer = nullptr;
     tech_pvt->pendingMarks = nullptr;
     tech_pvt->playoutSamplesDrained = 0;
@@ -325,11 +407,33 @@ namespace {
       tech_pvt->playoutBuffer = new PlayoutBuffer(PLAYOUT_BUFFER_MAX_SAMPLES);
       tech_pvt->pendingMarks = new PendingMarkQueue();
     }
+
+    // Set up the inbound resampler only if (a) binary streaming mode is on,
+    // (b) the server's sample rate is known, and (c) it differs from the
+    // channel's sample rate. JSON+base64 playAudio in Phase C assumes server
+    // rate matches channel rate — no resampling there for now.
+    if (bidirectional_audio_enable && bidirectional_audio_stream
+        && bidirectional_audio_sample_rate > 0
+        && bidirectional_audio_sample_rate != sampling) {
+      int rerr = 0;
+      tech_pvt->bidirectional_audio_resampler = speex_resampler_init(
+          1, bidirectional_audio_sample_rate, sampling, SWITCH_RESAMPLE_QUALITY, &rerr);
+      if (rerr != 0) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+          "Error initializing bidirectional audio resampler (%d → %d): %s.\n",
+          bidirectional_audio_sample_rate, sampling, speex_resampler_strerror(rerr));
+        return SWITCH_STATUS_FALSE;
+      }
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+        "(%u) bidirectional audio resampling: server %dHz → channel %dHz\n",
+        tech_pvt->id, bidirectional_audio_sample_rate, sampling);
+    }
     
     size_t buflen = LWS_PRE + (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PACKETIZATION_PERIOD * nAudioBufferSecs);
 
-    AudioPipe* ap = new AudioPipe(tech_pvt->sessionId, host, port, path, sslFlags, 
-      buflen, read_impl.decoded_bytes_per_packet, username, password, bugname, eventCallback);
+    AudioPipe* ap = new AudioPipe(tech_pvt->sessionId, host, port, path, sslFlags,
+      buflen, read_impl.decoded_bytes_per_packet, username, password, bugname,
+      bidirectional_audio_stream != 0, eventCallback);
     if (!ap) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error allocating AudioPipe\n");
       return SWITCH_STATUS_FALSE;
@@ -361,6 +465,10 @@ namespace {
     if (tech_pvt->resampler) {
       speex_resampler_destroy(tech_pvt->resampler);
       tech_pvt->resampler = nullptr;
+    }
+    if (tech_pvt->bidirectional_audio_resampler) {
+      speex_resampler_destroy(tech_pvt->bidirectional_audio_resampler);
+      tech_pvt->bidirectional_audio_resampler = nullptr;
     }
     if (tech_pvt->playoutBuffer) {
       delete static_cast<PlayoutBuffer*>(tech_pvt->playoutBuffer);
@@ -497,6 +605,8 @@ extern "C" {
               char *bugname,
               char* metadata,
               int bidirectional_audio_enable,
+              int bidirectional_audio_stream,
+              int bidirectional_audio_sample_rate,
               void **ppUserData)
   {
     // allocate per-session data structure
@@ -506,7 +616,8 @@ extern "C" {
       return SWITCH_STATUS_FALSE;
     }
     if (SWITCH_STATUS_SUCCESS != fork_data_init(tech_pvt, session, host, port, path, sslFlags, samples_per_second, sampling, channels,
-      bugname, metadata, bidirectional_audio_enable, responseHandler)) {
+      bugname, metadata, bidirectional_audio_enable, bidirectional_audio_stream, bidirectional_audio_sample_rate,
+      responseHandler)) {
       destroy_tech_pvt(tech_pvt);
       return SWITCH_STATUS_FALSE;
     }

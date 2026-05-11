@@ -25,10 +25,17 @@ public:
     CONNECT_FAIL,
     CONNECTION_DROPPED,
     CONNECTION_CLOSED_GRACEFULLY,
-    MESSAGE
+    MESSAGE,
+    BINARY
   };
   typedef void (*log_emit_function)(int level, const char *line);
-  typedef void (*notifyHandler_t)(const char *sessionId, const char* bugname, NotifyEvent_t event, const char* message);
+  /* Called from the lws service thread when an event of interest fires.
+   *   - MESSAGE events use `message` (null-terminated UTF-8 text) and ignore
+   *     `binary` / `binary_len`.
+   *   - BINARY events use `binary` / `binary_len` and ignore `message`.
+   *   - All other events use neither. */
+  typedef void (*notifyHandler_t)(const char *sessionId, const char* bugname, NotifyEvent_t event,
+                                  const char* message, const char* binary, size_t binary_len);
 
   struct lws_per_vhost_data {
     struct lws_context *context;
@@ -41,8 +48,9 @@ public:
   static bool lws_service_thread(unsigned int nServiceThread);
 
   // constructor
-  AudioPipe(const char* uuid, const char* host, unsigned int port, const char* path, int sslFlags, 
-    size_t bufLen, size_t minFreespace, const char* username, const char* password, char* bugname, notifyHandler_t callback);
+  AudioPipe(const char* uuid, const char* host, unsigned int port, const char* path, int sslFlags,
+    size_t bufLen, size_t minFreespace, const char* username, const char* password, char* bugname,
+    bool bidirectional_audio_stream, notifyHandler_t callback);
   ~AudioPipe();  
 
   LwsState_t getLwsState(void) { return m_state; }
@@ -79,6 +87,10 @@ public:
   void do_graceful_shutdown();
   bool isGracefulShutdown(void) {
     return m_gracefulShutdown;
+  }
+
+  bool isBidirectionalAudioStream(void) const {
+    return m_bidirectional_audio_stream;
   }
 
   void close() ;
@@ -142,6 +154,7 @@ private:
   std::string m_username;
   std::string m_password;
   bool m_gracefulShutdown;
+  bool m_bidirectional_audio_stream;
 };
 
 #endif

@@ -62,6 +62,8 @@ static switch_status_t start_capture(switch_core_session_t *session,
         int sampling,
         int sslFlags,
         int bidirectional_audio_enable,
+        int bidirectional_audio_stream,
+        int bidirectional_audio_sample_rate,
         char* bugname,
         char* metadata)
 {
@@ -74,8 +76,11 @@ static switch_status_t start_capture(switch_core_session_t *session,
   int channels = (flags & SMBF_STEREO) ? 2 : 1;
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-    "mod_audio_fork (%s): streaming %d sampling to %s path %s port %d tls: %s bidir: %s.\n",
-    bugname, sampling, host, path, port, sslFlags ? "yes" : "no", bidirectional_audio_enable ? "yes" : "no");
+    "mod_audio_fork (%s): streaming %d sampling to %s path %s port %d tls: %s bidir: %s stream: %s stream_rate: %d.\n",
+    bugname, sampling, host, path, port, sslFlags ? "yes" : "no",
+    bidirectional_audio_enable ? "yes" : "no",
+    bidirectional_audio_stream ? "yes" : "no",
+    bidirectional_audio_sample_rate);
 
 	if (switch_channel_get_private(channel, bugname)) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: bug %s already attached!\n", bugname);
@@ -91,7 +96,8 @@ static switch_status_t start_capture(switch_core_session_t *session,
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling fork_session_init.\n");
 	if (SWITCH_STATUS_FALSE == fork_session_init(session, responseHandler, read_codec->implementation->actual_samples_per_second,
-		host, port, path, sampling, sslFlags, channels, bugname, metadata, bidirectional_audio_enable, &pUserData)) {
+		host, port, path, sampling, sslFlags, channels, bugname, metadata,
+		bidirectional_audio_enable, bidirectional_audio_stream, bidirectional_audio_sample_rate, &pUserData)) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing mod_audio_fork session.\n");
 		return SWITCH_STATUS_FALSE;
 	}
@@ -168,10 +174,10 @@ static switch_status_t send_text(switch_core_session_t *session, char* bugname, 
   return status;
 }
 
-#define FORK_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | stop_play | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000 | 24000 | 32000 | 64000] [bugname] [metadata] [bidirectionalAudio_enabled]"
+#define FORK_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | stop_play | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000 | 24000 | 32000 | 64000] [bugname] [metadata] [bidirectionalAudio_enabled] [bidirectionalAudio_stream_enabled] [bidirectionalAudio_stream_samplerate]"
 SWITCH_STANDARD_API(fork_function)
 {
-	char *mycmd = NULL, *argv[8] = { 0 };
+	char *mycmd = NULL, *argv[10] = { 0 };
 	int argc = 0;
 	switch_status_t status = SWITCH_STATUS_FALSE;
   char *bugname = MY_BUG_NAME;
@@ -250,7 +256,21 @@ SWITCH_STANDARD_API(fork_function)
       	switch_media_bug_flag_t flags = SMBF_READ_STREAM ;
         char *metadata = NULL;
         int bidirectional_audio_enable = 0;
-        if (argc > 7) {
+        int bidirectional_audio_stream = 0;
+        int bidirectional_audio_sample_rate = 0;
+        // Three layered argument shapes for backward compatibility:
+        //   argc > 9  : ... bugname metadata bidir stream rate
+        //   argc > 7  : ... bugname metadata bidir
+        //   argc > 6  : ... bugname metadata
+        //   argc > 5  : ... (bugname xor metadata, disambiguated by '{')
+        if (argc > 9) {
+          if (argv[5][0] != '\0') bugname = argv[5];
+          if (argv[6][0] != '\0') metadata = argv[6];
+          bidirectional_audio_enable = !strcmp(argv[7], "true") ? 1 : 0;
+          bidirectional_audio_stream = !strcmp(argv[8], "true") ? 1 : 0;
+          bidirectional_audio_sample_rate = atoi(argv[9]);
+        }
+        else if (argc > 7) {
           if (argv[5][0] != '\0') bugname = argv[5];
           if (argv[6][0] != '\0') metadata = argv[6];
           bidirectional_audio_enable = !strcmp(argv[7], "true") ? 1 : 0;
@@ -294,7 +314,8 @@ SWITCH_STANDARD_API(fork_function)
           switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "invalid sample rate: %s\n", argv[4]);
 				}
         status = start_capture(lsession, flags, host, port, path, sampling, sslFlags,
-          bidirectional_audio_enable, bugname, metadata);
+          bidirectional_audio_enable, bidirectional_audio_stream, bidirectional_audio_sample_rate,
+          bugname, metadata);
 			}
       else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "unsupported mod_audio_fork cmd: %s\n", argv[1]);

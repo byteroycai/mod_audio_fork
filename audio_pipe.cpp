@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <iostream>
+#include <vector>
 
 /* discard incoming text messages over the socket that are longer than this */
 #define MAX_RECV_BUF_SIZE (65 * 1024 * 10)
@@ -40,10 +41,9 @@ int AudioPipe::lws_callback(struct lws *wsi,
   enum lws_callback_reasons reason,
   void *user, void *in, size_t len) {
 
-  struct AudioPipe::lws_per_vhost_data *vhd = 
+  struct AudioPipe::lws_per_vhost_data *vhd =
     (struct AudioPipe::lws_per_vhost_data *) lws_protocol_vh_priv_get(lws_get_vhost(wsi), lws_get_protocol(wsi));
 
-  struct lws_vhost* vhost = lws_get_vhost(wsi);
   AudioPipe ** ppAp = (AudioPipe **) user;
 
   switch (reason) {
@@ -79,15 +79,15 @@ int AudioPipe::lws_callback(struct lws *wsi,
       {
         AudioPipe* ap = findAndRemovePendingConnect(wsi);
         int rc = lws_http_client_http_response(wsi);
-        lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_CONNECTION_ERROR: %s, response status %d\n", in ? (char *)in : "(null)", rc); 
+        lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_CONNECTION_ERROR: %s, response status %d\n", in ? (char *)in : "(null)", rc);
         if (ap) {
           ap->m_state = LWS_CLIENT_FAILED;
-          ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECT_FAIL, (char *) in);
+          ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECT_FAIL, (char *) in, NULL, 0);
         }
         else {
-          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_CONNECTION_ERROR unable to find wsi %p..\n", wsi); 
+          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_CONNECTION_ERROR unable to find AudioPipe for wsi %p..\n", wsi);
         }
-      }      
+      }
       break;
 
     case LWS_CALLBACK_CLIENT_ESTABLISHED:
@@ -97,28 +97,30 @@ int AudioPipe::lws_callback(struct lws *wsi,
           *ppAp = ap;
           ap->m_vhd = vhd;
           ap->m_state = LWS_CLIENT_CONNECTED;
-          ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECT_SUCCESS, NULL);
+          ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECT_SUCCESS, NULL, NULL, 0);
         }
         else {
-          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_ESTABLISHED %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi); 
+          // Note: don't dereference ap — it's NULL on this path.
+          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_ESTABLISHED unable to find AudioPipe for wsi %p..\n", wsi);
         }
-      }      
+      }
       break;
     case LWS_CALLBACK_CLIENT_CLOSED:
       {
         AudioPipe* ap = *ppAp;
         if (!ap) {
-          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_CLOSED %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi); 
+          // Note: don't dereference ap — it's NULL on this path.
+          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_CLOSED unable to find AudioPipe for wsi %p..\n", wsi);
           return 0;
         }
         if (ap->m_state == LWS_CLIENT_DISCONNECTING) {
           // closed by us
-          ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECTION_CLOSED_GRACEFULLY, NULL);
+          ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECTION_CLOSED_GRACEFULLY, NULL, NULL, 0);
         }
         else if (ap->m_state == LWS_CLIENT_CONNECTED) {
           // closed by far end
           lwsl_notice("%s socket closed by far end\n", ap->m_uuid.c_str());
-          ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECTION_DROPPED, NULL);
+          ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECTION_DROPPED, NULL, NULL, 0);
         }
         ap->m_state = LWS_CLIENT_DISCONNECTED;
 
@@ -134,12 +136,22 @@ int AudioPipe::lws_callback(struct lws *wsi,
       {
         AudioPipe* ap = *ppAp;
         if (!ap) {
-          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_RECEIVE %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi); 
+          // Note: don't dereference ap — it's NULL on this path.
+          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_RECEIVE unable to find AudioPipe for wsi %p..\n", wsi);
           return 0;
         }
 
         if (lws_frame_is_binary(wsi)) {
-          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_RECEIVE received binary frame, discarding.\n");
+          // Binary frames carry raw L16 PCM in stream mode. Forward each
+          // chunk immediately — fragmentation handling is up to the caller
+          // (audio is order-tolerant; latency matters more than reassembly).
+          if (ap->isBidirectionalAudioStream() && len > 0) {
+            ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(),
+                           AudioPipe::BINARY, NULL, (const char *) in, len);
+          }
+          else if (len > 0) {
+            lwsl_warn("AudioPipe::lws_service_thread received unexpected binary frame (%zu bytes), discarding.\n", len);
+          }
           return 0;
         }
 
@@ -179,7 +191,7 @@ int AudioPipe::lws_callback(struct lws *wsi,
           if (lws_is_final_fragment(wsi)) {
             if (nullptr != ap->m_recv_buf) {
               std::string msg((char *)ap->m_recv_buf, ap->m_recv_buf_ptr - ap->m_recv_buf);
-              ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::MESSAGE, msg.c_str());
+              ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::MESSAGE, msg.c_str(), NULL, 0);
               if (nullptr != ap->m_recv_buf) free(ap->m_recv_buf);
             }
             ap->m_recv_buf = ap->m_recv_buf_ptr = nullptr;
@@ -193,7 +205,8 @@ int AudioPipe::lws_callback(struct lws *wsi,
       {
         AudioPipe* ap = *ppAp;
         if (!ap) {
-          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE %s unable to find wsi %p..\n", ap->m_uuid.c_str(), wsi); 
+          // Note: don't dereference ap — it's NULL on this path.
+          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE unable to find AudioPipe for wsi %p..\n", wsi);
           return 0;
         }
 
@@ -201,7 +214,7 @@ int AudioPipe::lws_callback(struct lws *wsi,
         if (ap->isGracefulShutdown()) {
           lwsl_notice("%s graceful shutdown - sending zero length binary frame to flush any final responses\n", ap->m_uuid.c_str());
           std::lock_guard<std::mutex> lk(ap->m_audio_mutex);
-          int sent = lws_write(wsi, (unsigned char *) ap->m_audio_buffer + LWS_PRE, 0, LWS_WRITE_BINARY);
+          lws_write(wsi, (unsigned char *) ap->m_audio_buffer + LWS_PRE, 0, LWS_WRITE_BINARY);
           return 0;
         }
 
@@ -209,10 +222,12 @@ int AudioPipe::lws_callback(struct lws *wsi,
         {
           std::lock_guard<std::mutex> lk(ap->m_text_mutex);
           if (ap->m_metadata.length() > 0) {
-            uint8_t buf[ap->m_metadata.length() + LWS_PRE];
-            memcpy(buf + LWS_PRE, ap->m_metadata.c_str(), ap->m_metadata.length());
-            int n = ap->m_metadata.length();
-            int m = lws_write(wsi, buf + LWS_PRE, n, LWS_WRITE_TEXT);
+            // std::vector instead of a VLA (GCC extension, not C++ standard,
+            // and large metadata would risk a stack overflow).
+            std::vector<uint8_t> buf(ap->m_metadata.length() + LWS_PRE);
+            memcpy(buf.data() + LWS_PRE, ap->m_metadata.c_str(), ap->m_metadata.length());
+            int n = static_cast<int>(ap->m_metadata.length());
+            int m = lws_write(wsi, buf.data() + LWS_PRE, n, LWS_WRITE_TEXT);
             ap->m_metadata.clear();
             if (m < n) {
               return -1;
@@ -237,9 +252,9 @@ int AudioPipe::lws_callback(struct lws *wsi,
           if (ap->m_audio_buffer_write_offset > LWS_PRE) {
             size_t datalen = ap->m_audio_buffer_write_offset - LWS_PRE;
             int sent = lws_write(wsi, (unsigned char *) ap->m_audio_buffer + LWS_PRE, datalen, LWS_WRITE_BINARY);
-            if (sent < datalen) {
-              lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE %s attemped to send %lu only sent %d wsi %p..\n", 
-                ap->m_uuid.c_str(), datalen, sent, wsi); 
+            if (sent < 0 || (size_t)sent < datalen) {
+              lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE %s attempted to send %lu only sent %d wsi %p..\n",
+                ap->m_uuid.c_str(), datalen, sent, wsi);
             }
             ap->m_audio_buffer_write_offset = LWS_PRE;
           }
@@ -301,7 +316,7 @@ void AudioPipe::processPendingConnects(lws_per_vhost_data *vhd) {
   }
 }
 
-void AudioPipe::processPendingDisconnects(lws_per_vhost_data *vhd) {
+void AudioPipe::processPendingDisconnects(lws_per_vhost_data * /*vhd*/) {
   std::list<AudioPipe*> disconnects;
   {
     std::lock_guard<std::mutex> guard(mutex_disconnects);
@@ -405,8 +420,11 @@ bool AudioPipe::lws_service_thread(unsigned int nServiceThread) {
       AudioPipe::lws_callback,
       sizeof(void *),
       1024,
+      0,        // id
+      nullptr,  // user
+      0         // tx_packet_size
     },
-    { NULL, NULL, 0, 0 }
+    { NULL, NULL, 0, 0, 0, nullptr, 0 }
   };
 
   memset(&info, 0, sizeof info); 
@@ -493,14 +511,16 @@ bool AudioPipe::deinitialize() {
 // header so the compiler doesn't warn — the actual run-time order is always
 // the declaration order regardless.
 AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, const char* path,
-  int sslFlags, size_t bufLen, size_t minFreespace, const char* username, const char* password, char* bugname, notifyHandler_t callback) :
+  int sslFlags, size_t bufLen, size_t minFreespace, const char* username, const char* password, char* bugname,
+  bool bidirectional_audio_stream, notifyHandler_t callback) :
   m_state(LWS_CLIENT_IDLE),
   m_uuid(uuid), m_host(host), m_bugname(bugname), m_port(port), m_path(path),
   m_sslFlags(sslFlags), m_wsi(nullptr),
   m_audio_buffer_max_len(bufLen), m_audio_buffer_write_offset(LWS_PRE),
   m_audio_buffer_min_freespace(minFreespace),
   m_recv_buf(nullptr), m_recv_buf_ptr(nullptr),
-  m_vhd(nullptr), m_callback(callback), m_gracefulShutdown(false) {
+  m_vhd(nullptr), m_callback(callback),
+  m_gracefulShutdown(false), m_bidirectional_audio_stream(bidirectional_audio_stream) {
 
   if (username && password) {
     m_username.assign(username);

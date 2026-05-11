@@ -54,6 +54,17 @@ struct private_data {
   void *playoutBuffer;
   int bidirectional_audio_enable;
 
+  /* Binary streaming mode: server sends raw L16 PCM directly over WebSocket
+   * binary frames instead of base64-in-JSON. If the server's sample rate
+   * differs from the channel rate, bidirectional_audio_resampler converts
+   * the incoming PCM on the fly. set_aside_byte / has_set_aside_byte hold
+   * the trailing odd byte across WS frames so we never split a sample. */
+  int bidirectional_audio_stream;
+  int bidirectional_audio_sample_rate;
+  SpeexResamplerState *bidirectional_audio_resampler;
+  uint8_t set_aside_byte;
+  int has_set_aside_byte;
+
   /* Playback synchronization markers (mark / clearMarks protocol).
    * pendingMarks is a std::deque<PendingMark>* — see lws_glue.cpp.
    * playoutSamplesDrained is a monotonic counter incremented as
