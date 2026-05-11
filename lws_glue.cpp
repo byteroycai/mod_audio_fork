@@ -39,6 +39,17 @@ namespace {
   static unsigned int nServiceThreads = std::max(1, std::min(requestedNumServiceThreads ? ::atoi(requestedNumServiceThreads) : 1, 5));
   static unsigned int idxCallCount = 0;
 
+  /* Drop all pending PCM in the playout buffer under mutex. Safe to call on
+   * a tech_pvt without a playoutBuffer (no-op in that case). Used by killAudio
+   * (server-initiated) and stop_play (API-initiated). */
+  void clearPlayoutBuffer(private_t* tech_pvt) {
+    if (!tech_pvt || !tech_pvt->playoutBuffer) return;
+    switch_mutex_lock(tech_pvt->mutex);
+    PlayoutBuffer* buf = static_cast<PlayoutBuffer*>(tech_pvt->playoutBuffer);
+    buf->clear();
+    switch_mutex_unlock(tech_pvt->mutex);
+  }
+
   void processIncomingMessage(private_t* tech_pvt, switch_core_session_t* session, const char* message) {
     std::string msg = message;
     std::string type;
@@ -95,11 +106,14 @@ namespace {
         }
       }
       else if (0 == type.compare("killAudio")) {
-        tech_pvt->responseHandler(session, EVENT_KILL_AUDIO, NULL);
-
-        // kill any current playback on the channel
+        // Stop both kinds of playback the caller might be hearing:
+        //   * in-memory playoutBuffer drained by dub_speech_frame (our own
+        //     bidirectional path)
+        //   * any active playback() from the dialplan (file-based)
+        clearPlayoutBuffer(tech_pvt);
         switch_channel_t *channel = switch_core_session_get_channel(session);
         switch_channel_set_flag_value(channel, CF_BREAK, 2);
+        tech_pvt->responseHandler(session, EVENT_KILL_AUDIO, NULL);
       }
       else if (0 == type.compare("transcription")) {
         char* jsonString = cJSON_PrintUnformatted(jsonData);
@@ -463,6 +477,20 @@ extern "C" {
     AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
 
+    return SWITCH_STATUS_SUCCESS;
+  }
+
+  switch_status_t fork_session_stop_play(switch_core_session_t *session, char *bugname) {
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    switch_media_bug_t *bug = (switch_media_bug_t*) switch_channel_get_private(channel, bugname);
+    if (!bug) {
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "fork_session_stop_play failed because no bug\n");
+      return SWITCH_STATUS_FALSE;
+    }
+    private_t* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+    if (!tech_pvt) return SWITCH_STATUS_FALSE;
+
+    clearPlayoutBuffer(tech_pvt);
     return SWITCH_STATUS_SUCCESS;
   }
 

@@ -136,6 +136,12 @@ static switch_status_t do_pauseresume(switch_core_session_t *session, char* bugn
 	return status;
 }
 
+static switch_status_t do_stop_play(switch_core_session_t *session, char* bugname)
+{
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_fork (%s): stop_play\n", bugname);
+	return fork_session_stop_play(session, bugname);
+}
+
 static switch_status_t do_graceful_shutdown(switch_core_session_t *session, char* bugname)
 {
 	switch_status_t status = SWITCH_STATUS_SUCCESS;
@@ -162,7 +168,7 @@ static switch_status_t send_text(switch_core_session_t *session, char* bugname, 
   return status;
 }
 
-#define FORK_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000 | 24000 | 32000 | 64000] [bugname] [metadata] [bidirectionalAudio_enabled]"
+#define FORK_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | stop_play | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000 | 24000 | 32000 | 64000] [bugname] [metadata] [bidirectionalAudio_enabled]"
 SWITCH_STANDARD_API(fork_function)
 {
 	char *mycmd = NULL, *argv[8] = { 0 };
@@ -198,6 +204,10 @@ SWITCH_STANDARD_API(fork_function)
           else bugname = argv[2];
         }
 				status = do_stop(lsession, bugname, text);
+      }
+			else if (!strcasecmp(argv[1], "stop_play")) {
+        if (argc > 2) bugname = argv[2];
+				status = do_stop_play(lsession, bugname);
       }
 			else if (!strcasecmp(argv[1], "pause")) {
         if (argc > 2) bugname = argv[2];
