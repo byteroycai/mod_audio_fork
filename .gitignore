@@ -1,0 +1,32 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+*.o
+*.lo
+*.la
+*.so
+*.dylib
+*.a
+
+# CMake artifacts when configured in-tree (don't do that, but just in case)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Autotools artifacts (if anyone runs autoreconf accidentally)
+.deps/
+.libs/
+autom4te.cache/
+config.log
+config.status
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
