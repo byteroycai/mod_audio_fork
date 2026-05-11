@@ -53,6 +53,14 @@ struct private_data {
    * Only allocated when bidirectional_audio_enable is non-zero. */
   void *playoutBuffer;
   int bidirectional_audio_enable;
+
+  /* Playback synchronization markers (mark / clearMarks protocol).
+   * pendingMarks is a std::deque<PendingMark>* — see lws_glue.cpp.
+   * playoutSamplesDrained is a monotonic counter incremented as
+   * dub_speech_frame consumes samples; each mark records a target sample
+   * index and fires once the counter passes it. */
+  void *pendingMarks;
+  uint64_t playoutSamplesDrained;
 };
 
 typedef struct private_data private_t;

@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 #include <regex>
+#include <deque>
 
 #include <boost/circular_buffer.hpp>
 
@@ -28,7 +29,17 @@
  * ~10s at 16kHz; older data gets evicted in FIFO order. */
 #define PLAYOUT_BUFFER_MAX_SAMPLES (160000)
 
+/* Soft cap on pending playback markers; new marks beyond this are dropped
+ * with a warning so a misbehaving server can't grow the queue unbounded. */
+#define MAX_PENDING_MARKS (30)
+
 typedef boost::circular_buffer<int16_t> PlayoutBuffer;
+
+struct PendingMark {
+  std::string name;
+  uint64_t targetSample;  // fire once playoutSamplesDrained reaches this value
+};
+typedef std::deque<PendingMark> PendingMarkQueue;
 
 namespace {
   static const char *requestedBufferSecs = std::getenv("MOD_AUDIO_FORK_BUFFER_SECS");
@@ -39,14 +50,43 @@ namespace {
   static unsigned int nServiceThreads = std::max(1, std::min(requestedNumServiceThreads ? ::atoi(requestedNumServiceThreads) : 1, 5));
   static unsigned int idxCallCount = 0;
 
-  /* Drop all pending PCM in the playout buffer under mutex. Safe to call on
-   * a tech_pvt without a playoutBuffer (no-op in that case). Used by killAudio
+  /* Build and send a {"type":"mark","data":{"name":"...","event":"..."}}
+   * frame back to the server. Caller may hold tech_pvt->mutex (the AudioPipe
+   * write path only acquires its own internal text mutex). The mark name is
+   * passed through verbatim; callers are responsible for ensuring it doesn't
+   * contain characters that break JSON (the server is the source of these
+   * names so this is normally already true). */
+  void sendMarkEvent(private_t* tech_pvt, const std::string& name, const char* eventType) {
+    AudioPipe* ap = static_cast<AudioPipe*>(tech_pvt->pAudioPipe);
+    if (!ap) return;
+    std::ostringstream json;
+    json << "{\"type\":\"mark\",\"data\":{\"name\":\"" << name
+         << "\",\"event\":\"" << eventType << "\"}}";
+    ap->bufferForSending(json.str().c_str());
+  }
+
+  /* Fire and drop every queued mark with the given event type. Caller must
+   * already hold tech_pvt->mutex. Used by clearMarks (eventType="cleared"),
+   * killAudio, and stop_play. */
+  void flushPendingMarksLocked(private_t* tech_pvt, const char* eventType) {
+    if (!tech_pvt->pendingMarks) return;
+    PendingMarkQueue* q = static_cast<PendingMarkQueue*>(tech_pvt->pendingMarks);
+    while (!q->empty()) {
+      sendMarkEvent(tech_pvt, q->front().name, eventType);
+      q->pop_front();
+    }
+  }
+
+  /* Drop all pending PCM in the playout buffer (and fire any pending marks
+   * as cleared, since they can no longer be reached). Safe to call on a
+   * tech_pvt without a playoutBuffer (no-op in that case). Used by killAudio
    * (server-initiated) and stop_play (API-initiated). */
   void clearPlayoutBuffer(private_t* tech_pvt) {
     if (!tech_pvt || !tech_pvt->playoutBuffer) return;
     switch_mutex_lock(tech_pvt->mutex);
     PlayoutBuffer* buf = static_cast<PlayoutBuffer*>(tech_pvt->playoutBuffer);
     buf->clear();
+    flushPendingMarksLocked(tech_pvt, "cleared");
     switch_mutex_unlock(tech_pvt->mutex);
   }
 
@@ -114,6 +154,53 @@ namespace {
         switch_channel_t *channel = switch_core_session_get_channel(session);
         switch_channel_set_flag_value(channel, CF_BREAK, 2);
         tech_pvt->responseHandler(session, EVENT_KILL_AUDIO, NULL);
+      }
+      else if (0 == type.compare("mark")) {
+        // Register a playback marker — fires a "playout" event back to the
+        // server when all currently-buffered audio has been played.
+        if (!tech_pvt->bidirectional_audio_enable || !tech_pvt->pendingMarks) {
+          switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+            "(%u) processIncomingMessage - mark received but bidirectional audio is disabled, ignoring\n",
+            tech_pvt->id);
+        }
+        else if (!jsonData) {
+          switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+            "(%u) processIncomingMessage - missing data payload in mark request\n", tech_pvt->id);
+        }
+        else {
+          cJSON* jsonName = cJSON_GetObjectItem(jsonData, "name");
+          if (!jsonName || !cJSON_IsString(jsonName) || !jsonName->valuestring) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+              "(%u) processIncomingMessage - mark missing 'name'\n", tech_pvt->id);
+          }
+          else {
+            switch_mutex_lock(tech_pvt->mutex);
+            PendingMarkQueue* q = static_cast<PendingMarkQueue*>(tech_pvt->pendingMarks);
+            if (q->size() >= MAX_PENDING_MARKS) {
+              switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                "(%u) processIncomingMessage - pending mark queue full (%d), dropping '%s'\n",
+                tech_pvt->id, MAX_PENDING_MARKS, jsonName->valuestring);
+            }
+            else {
+              PlayoutBuffer* buf = static_cast<PlayoutBuffer*>(tech_pvt->playoutBuffer);
+              uint64_t targetSample = tech_pvt->playoutSamplesDrained + (buf ? buf->size() : 0);
+              q->push_back({ std::string(jsonName->valuestring), targetSample });
+              switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                "(%u) processIncomingMessage - queued mark '%s' at sample %llu\n",
+                tech_pvt->id, jsonName->valuestring, (unsigned long long)targetSample);
+            }
+            switch_mutex_unlock(tech_pvt->mutex);
+          }
+        }
+      }
+      else if (0 == type.compare("clearMarks")) {
+        // Drop all pending markers and notify the server that each was cleared.
+        // Audio playout is NOT interrupted (use killAudio / stop_play for that).
+        if (tech_pvt->pendingMarks) {
+          switch_mutex_lock(tech_pvt->mutex);
+          flushPendingMarksLocked(tech_pvt, "cleared");
+          switch_mutex_unlock(tech_pvt->mutex);
+        }
       }
       else if (0 == type.compare("transcription")) {
         char* jsonString = cJSON_PrintUnformatted(jsonData);
@@ -229,11 +316,14 @@ namespace {
     tech_pvt->graceful_shutdown = 0;
     tech_pvt->bidirectional_audio_enable = bidirectional_audio_enable;
     tech_pvt->playoutBuffer = nullptr;
+    tech_pvt->pendingMarks = nullptr;
+    tech_pvt->playoutSamplesDrained = 0;
     strncpy(tech_pvt->bugname, bugname, MAX_BUG_LEN);
     if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN - 1);
 
     if (bidirectional_audio_enable) {
       tech_pvt->playoutBuffer = new PlayoutBuffer(PLAYOUT_BUFFER_MAX_SAMPLES);
+      tech_pvt->pendingMarks = new PendingMarkQueue();
     }
     
     size_t buflen = LWS_PRE + (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PACKETIZATION_PERIOD * nAudioBufferSecs);
@@ -275,6 +365,10 @@ namespace {
     if (tech_pvt->playoutBuffer) {
       delete static_cast<PlayoutBuffer*>(tech_pvt->playoutBuffer);
       tech_pvt->playoutBuffer = nullptr;
+    }
+    if (tech_pvt->pendingMarks) {
+      delete static_cast<PendingMarkQueue*>(tech_pvt->pendingMarks);
+      tech_pvt->pendingMarks = nullptr;
     }
     if (tech_pvt->mutex) {
       switch_mutex_destroy(tech_pvt->mutex);
@@ -645,6 +739,19 @@ extern "C" {
     }
     if (to_copy < samples_needed) {
       std::fill(out + to_copy, out + samples_needed, 0);
+    }
+
+    // Advance the playback counter only by samples actually drained from the
+    // buffer; padding silence doesn't count as "playing the queued audio".
+    tech_pvt->playoutSamplesDrained += to_copy;
+
+    // Fire any marks whose target sample index we just passed.
+    if (tech_pvt->pendingMarks) {
+      PendingMarkQueue* q = static_cast<PendingMarkQueue*>(tech_pvt->pendingMarks);
+      while (!q->empty() && q->front().targetSample <= tech_pvt->playoutSamplesDrained) {
+        sendMarkEvent(tech_pvt, q->front().name, "playout");
+        q->pop_front();
+      }
     }
     switch_mutex_unlock(tech_pvt->mutex);
 
