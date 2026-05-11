@@ -2,9 +2,39 @@
 
 A Freeswitch module that attaches a bug to a media server endpoint and streams L16 audio via websockets to a remote server.  This module also supports receiving media from the server to play back to the caller, enabling the creation of full-fledged IVR or dialog-type applications.
 
+## Build & install
+
+Out-of-tree CMake build against an installed FreeSWITCH. Full details and
+per-distro dependency hints are in [BUILD.md](BUILD.md).
+
+```bash
+# 1. Install dependencies (Debian/Ubuntu shown; see BUILD.md for others)
+sudo apt-get install -y cmake build-essential pkg-config \
+    libwebsockets-dev libspeexdsp-dev libboost-dev freeswitch-dev
+
+# 2. Build mod_audio_fork.so
+./build.sh build
+#   -> build/mod_audio_fork.so
+
+# 3. Install into FreeSWITCH's module directory
+sudo ./build.sh install
+#   -> /usr/local/freeswitch/mod/mod_audio_fork.so
+
+# 4. Tell FreeSWITCH to load it (add to modules.conf.xml)
+#    <load module="mod_audio_fork"/>
+fs_cli -x "reload mod_audio_fork"
+```
+
+Override the FreeSWITCH location with `FREESWITCH_INCLUDE_DIR=...
+FREESWITCH_LIBRARY=...` (passed straight through to CMake), or the
+install target with `FREESWITCH_MOD_DIR=...`. See [BUILD.md](BUILD.md)
+for non-standard layouts and the manual `cmake` invocation.
+
 #### Environment variables
 - MOD_AUDIO_FORK_SUBPROTOCOL_NAME - optional, name of the [websocket sub-protocol](https://tools.ietf.org/html/rfc6455#section-1.9) to advertise; defaults to "audio.drachtio.org"
 - MOD_AUDIO_FORK_SERVICE_THREADS - optional, number of libwebsocket service threads to create; these threads handling sending all messages for all sessions.  Defaults to 1, but can be set to as many as 5.
+- MOD_AUDIO_FORK_BUFFER_SECS - optional, size of the outbound audio buffer in seconds (1–5); defaults to 2.
+- MOD_AUDIO_FORK_TCP_KEEPALIVE_SECS - optional, TCP keep-alive idle interval on the WebSocket socket; defaults to 55 seconds.
 
 ## API
 
@@ -169,19 +199,22 @@ ep.forkAudioSendText(moremetadata);
 ep.forkAudioStop(evenmoremetadata);
 ```
 Each of the methods above returns a promise that resolves when the api command has been executed, or throws an error.
-## Examples
-[audio_fork.js](../../examples/audio_fork.js) provides an example of an application that connects an incoming call to Freeswitch and then forks the audio to a remote websocket server.
 
-To run this app, you can run [the simple websocket server provided](../../examples/ws_server.js) in a separate terminal.  It will listen on port 3001 and will simply write the incoming raw audio to `/tmp/audio.raw` in linear16 format with no header or file container.
+## Tests
 
-So in the first terminal window run:
-```
-node ws_server.js
-```
-And in the second window run:
-```
-node audio_fork.js http://localhost:3001
-```
-The app uses text-to-speech to play prompts, so you will need mod_google_tts loaded as well, and configured to use your GCS cloud credentials to access Google Cloud Text-to-Speech.  (If you don't want to run mod_google_tts you can of course simply modify the application remove the prompt, just be aware that you will hear silence when you connect, and should simply begin speaking after the call connects).
+See [tests/README.md](tests/README.md) for the smoke + protocol test
+suite. TL;DR:
 
+```bash
+./tests/smoke.sh           # build / load / API surface
+./tests/protocol_test.sh   # end-to-end WS protocol against a mock peer
+```
 
+## License
+
+Released under the MIT License — see [LICENSE](LICENSE) for the full text.
+
+Originally derived from the `mod_audio_fork` module in
+[drachtio/drachtio-freeswitch-modules](https://github.com/drachtio/drachtio-freeswitch-modules)
+and maintained independently here under the same MIT terms.
+Original copyright remains with Drachtio Communications Services, LLC.
