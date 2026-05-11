@@ -178,28 +178,6 @@ The error data can be any JSON object and is left for the application to the app
 **Name**: mod_audio_fork::error
 **Body**: JSON string - the data attribute from the server message
 
-## Usage
-When using [drachtio-fsrmf](https://www.npmjs.com/package/drachtio-fsmrf), you can access this API command via the api method on the 'endpoint' object.
-```js
-const url = 'https://70f21a76.ngrok.io';
-const callerData = {to: '6173333456', from: '2061236666', callid: req.get('Call-Id')};
-ep.api('uuid_audio_fork', `${ep.uuid} start ${url} mono 8k ${JSON.stringify(callerData)}`);
-```
-or, from version 1.4.1 on, by using the Endpoint convenience methods:
-```js
-await ep.forkAudioStart({
-  wsUrl,
-  mixType: 'stereo',
-  sampling: '16k',
-  metadata
-});
-..
-ep.forkAudioSendText(moremetadata);
-..
-ep.forkAudioStop(evenmoremetadata);
-```
-Each of the methods above returns a promise that resolves when the api command has been executed, or throws an error.
-
 ## Tests
 
 See [tests/README.md](tests/README.md) for the smoke + protocol test
