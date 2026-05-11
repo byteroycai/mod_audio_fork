@@ -489,13 +489,18 @@ bool AudioPipe::deinitialize() {
   return true;
 }
 
-// instance members
+// instance members. Initializer order matches the declaration order in the
+// header so the compiler doesn't warn — the actual run-time order is always
+// the declaration order regardless.
 AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, const char* path,
   int sslFlags, size_t bufLen, size_t minFreespace, const char* username, const char* password, char* bugname, notifyHandler_t callback) :
-  m_uuid(uuid), m_host(host), m_port(port), m_path(path), m_sslFlags(sslFlags),
-  m_audio_buffer_min_freespace(minFreespace), m_audio_buffer_max_len(bufLen), m_gracefulShutdown(false),
-  m_audio_buffer_write_offset(LWS_PRE), m_recv_buf(nullptr), m_recv_buf_ptr(nullptr), m_bugname(bugname),
-  m_state(LWS_CLIENT_IDLE), m_wsi(nullptr), m_vhd(nullptr), m_callback(callback) {
+  m_state(LWS_CLIENT_IDLE),
+  m_uuid(uuid), m_host(host), m_bugname(bugname), m_port(port), m_path(path),
+  m_sslFlags(sslFlags), m_wsi(nullptr),
+  m_audio_buffer_max_len(bufLen), m_audio_buffer_write_offset(LWS_PRE),
+  m_audio_buffer_min_freespace(minFreespace),
+  m_recv_buf(nullptr), m_recv_buf_ptr(nullptr),
+  m_vhd(nullptr), m_callback(callback), m_gracefulShutdown(false) {
 
   if (username && password) {
     m_username.assign(username);

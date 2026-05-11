@@ -27,22 +27,24 @@ static void responseHandler(switch_core_session_t* session, const char * eventNa
 
 static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, switch_abc_type_t type)
 {
+	(void)user_data;
 	switch_core_session_t *session = switch_core_media_bug_get_session(bug);
+	private_t* tech_pvt = (private_t *) switch_core_media_bug_get_user_data(bug);
+
 	switch (type) {
 	case SWITCH_ABC_TYPE_INIT:
 		break;
 
 	case SWITCH_ABC_TYPE_CLOSE:
-		{
-      private_t* tech_pvt = (private_t *)  switch_core_media_bug_get_user_data(bug);
-			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Got SWITCH_ABC_TYPE_CLOSE for bug %s\n", tech_pvt->bugname);
-      fork_session_cleanup(session, tech_pvt->bugname, NULL, 1);
-		}
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Got SWITCH_ABC_TYPE_CLOSE for bug %s\n", tech_pvt->bugname);
+		fork_session_cleanup(session, tech_pvt->bugname, NULL, 1);
 		break;
-	
+
 	case SWITCH_ABC_TYPE_READ:
 		return fork_frame(session, bug);
-		break;
+
+	case SWITCH_ABC_TYPE_WRITE_REPLACE:
+		return dub_speech_frame(bug, tech_pvt);
 
 	case SWITCH_ABC_TYPE_WRITE:
 	default:
@@ -52,14 +54,15 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
 	return SWITCH_TRUE;
 }
 
-static switch_status_t start_capture(switch_core_session_t *session, 
-        switch_media_bug_flag_t flags, 
+static switch_status_t start_capture(switch_core_session_t *session,
+        switch_media_bug_flag_t flags,
         char* host,
-        unsigned int port, 
+        unsigned int port,
         char* path,
         int sampling,
         int sslFlags,
-	      char* bugname, 
+        int bidirectional_audio_enable,
+        char* bugname,
         char* metadata)
 {
 	switch_channel_t *channel = switch_core_session_get_channel(session);
@@ -70,9 +73,9 @@ static switch_status_t start_capture(switch_core_session_t *session,
 	void *pUserData = NULL;
   int channels = (flags & SMBF_STEREO) ? 2 : 1;
 
-	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, 
-    "mod_audio_fork (%s): streaming %d sampling to %s path %s port %d tls: %s.\n", 
-    bugname, sampling, host, path, port, sslFlags ? "yes" : "no");
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+    "mod_audio_fork (%s): streaming %d sampling to %s path %s port %d tls: %s bidir: %s.\n",
+    bugname, sampling, host, path, port, sslFlags ? "yes" : "no", bidirectional_audio_enable ? "yes" : "no");
 
 	if (switch_channel_get_private(channel, bugname)) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: bug %s already attached!\n", bugname);
@@ -87,8 +90,8 @@ static switch_status_t start_capture(switch_core_session_t *session,
 	}
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling fork_session_init.\n");
-	if (SWITCH_STATUS_FALSE == fork_session_init(session, responseHandler, read_codec->implementation->actual_samples_per_second, 
-		host, port, path, sampling, sslFlags, channels, bugname, metadata, &pUserData)) {
+	if (SWITCH_STATUS_FALSE == fork_session_init(session, responseHandler, read_codec->implementation->actual_samples_per_second,
+		host, port, path, sampling, sslFlags, channels, bugname, metadata, bidirectional_audio_enable, &pUserData)) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing mod_audio_fork session.\n");
 		return SWITCH_STATUS_FALSE;
 	}
@@ -159,10 +162,10 @@ static switch_status_t send_text(switch_core_session_t *session, char* bugname, 
   return status;
 }
 
-#define FORK_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000 | 24000 | 32000 | 64000] [bugname] [metadata]"
+#define FORK_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000 | 24000 | 32000 | 64000] [bugname] [metadata] [bidirectionalAudio_enabled]"
 SWITCH_STANDARD_API(fork_function)
 {
-	char *mycmd = NULL, *argv[7] = { 0 };
+	char *mycmd = NULL, *argv[8] = { 0 };
 	int argc = 0;
 	switch_status_t status = SWITCH_STATUS_FALSE;
   char *bugname = MY_BUG_NAME;
@@ -233,13 +236,22 @@ SWITCH_STANDARD_API(fork_function)
         int sampling = 8000;
       	switch_media_bug_flag_t flags = SMBF_READ_STREAM ;
         char *metadata = NULL;
-        if( argc > 6) {
+        int bidirectional_audio_enable = 0;
+        if (argc > 7) {
+          if (argv[5][0] != '\0') bugname = argv[5];
+          if (argv[6][0] != '\0') metadata = argv[6];
+          bidirectional_audio_enable = !strcmp(argv[7], "true") ? 1 : 0;
+        }
+        else if (argc > 6) {
           bugname = argv[5];
           metadata = argv[6];
         }
         else if (argc > 5) {
           if (argv[5][0] == '{' || argv[5][0] == '[') metadata = argv[5];
           else bugname = argv[5];
+        }
+        if (bidirectional_audio_enable) {
+          flags |= SMBF_WRITE_REPLACE;
         }
         if (0 == strcmp(argv[3], "mixed")) {
           flags |= SMBF_WRITE_STREAM ;
@@ -266,9 +278,10 @@ SWITCH_STANDARD_API(fork_function)
           switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "invalid websocket uri: %s\n", argv[2]);
         }
 				else if (sampling % 8000 != 0) {
-          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "invalid sample rate: %s\n", argv[4]);					
+          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "invalid sample rate: %s\n", argv[4]);
 				}
-        status = start_capture(lsession, flags, host, port, path, sampling, sslFlags, bugname, metadata);
+        status = start_capture(lsession, flags, host, port, path, sampling, sslFlags,
+          bidirectional_audio_enable, bugname, metadata);
 			}
       else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "unsupported mod_audio_fork cmd: %s\n", argv[1]);

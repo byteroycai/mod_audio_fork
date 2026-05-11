@@ -26,11 +26,6 @@
 
 #define MAX_METADATA_LEN (8192)
 
-struct playout {
-  char *file;
-  struct playout* next;
-};
-
 typedef void (*responseHandler_t)(switch_core_session_t* session, const char* eventName, char* json);
 
 struct private_data {
@@ -45,13 +40,19 @@ struct private_data {
   unsigned int port;
   char path[MAX_PATH_LEN];
   int sampling;
-  struct playout* playout;
   int  channels;
   unsigned int id;
   int buffer_overrun_notified:1;
   int audio_paused:1;
   int graceful_shutdown:1;
   char initialMetadata[8192];
+
+  /* Bidirectional audio: server-sent PCM played back to the caller via
+   * SWITCH_ABC_TYPE_WRITE_REPLACE. playoutBuffer is a
+   * boost::circular_buffer<int16_t>* — void* because this is a C header.
+   * Only allocated when bidirectional_audio_enable is non-zero. */
+  void *playoutBuffer;
+  int bidirectional_audio_enable;
 };
 
 typedef struct private_data private_t;
