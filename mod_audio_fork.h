@@ -23,6 +23,8 @@
 #define EVENT_CONNECT_FAIL    "mod_audio_fork::connect_failed"
 #define EVENT_BUFFER_OVERRUN  "mod_audio_fork::buffer_overrun"
 #define EVENT_JSON            "mod_audio_fork::json"
+/* PR-2: trylock contention in fork_frame. Throttled — see lws_glue.cpp. */
+#define EVENT_FRAME_DROPPED   "mod_audio_fork::frame_dropped"
 
 #define MAX_METADATA_LEN (8192)
 
@@ -72,6 +74,39 @@ struct private_data {
    * index and fires once the counter passes it. */
   void *pendingMarks;
   uint64_t playoutSamplesDrained;
+
+  /* ════════════════════════════════════════════════════════════════════════
+   * PR-2: make trylock contention in fork_frame visible
+   * ════════════════════════════════════════════════════════════════════════
+   *
+   * fork_frame() takes tech_pvt->mutex with switch_mutex_trylock and, on
+   * failure, simply returns — the frame's drain is skipped. That is not lost
+   * audio (the backlog is read on the next successful acquire, see A10) but it
+   * IS jitter, and it was **completely invisible**: no counter, no event, no
+   * log. `dc_fork_frame_dropped_total` existed on the Go side with a comment
+   * saying "available after PR-2" and had no writer at all.
+   *
+   * ⚠ Do not add the counter and then optimise the lock (PR-5/6). Without a
+   *   number first, "did it get better?" can only be answered from CPU curves.
+   *   That ordering is CONSTRAINTS.md's sequence discipline ①.
+   *
+   * framesDroppedLock  monotonic, never reset — a rate is computed by the
+   *                    consumer, and a counter that resets loses the history
+   *                    exactly when someone finally looks at it.
+   * lastDropReportedAt last report time in **frames** (not wall clock), so the
+   *                    throttle needs no clock call on the audio path. */
+  uint64_t framesDroppedLock;
+  uint64_t lastDropReportedAt;
+  /* How many skipped frames between reports. Default FRAME_DROP_REPORT_EVERY;
+   * override per call with the channel variable
+   * MOD_AUDIO_FORK_DROP_REPORT_EVERY.
+   *
+   * ★ Settable for two reasons, and the second is not "so tests can pass":
+   *   · a test cannot otherwise provoke a report — 500 skipped frames is ~10s
+   *     of *sustained contention*, which a 15-second suite will not produce
+   *   · an operator chasing jitter on one call wants it turned down, and
+   *     rebuilding the module to do that is not a real option */
+  uint64_t dropReportEvery;
 };
 
 typedef struct private_data private_t;

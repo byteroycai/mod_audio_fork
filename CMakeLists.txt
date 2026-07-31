@@ -96,6 +96,11 @@ add_executable(ws_uri_test tests/ws_uri_test.cpp ws_uri.cpp)
 target_include_directories(ws_uri_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(ws_uri_test PRIVATE -Wall -Wextra)
 
+# drop_throttle.hpp is header-only, so this links nothing at all.
+add_executable(throttle_test tests/throttle_test.cpp)
+target_include_directories(throttle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(throttle_test PRIVATE -Wall -Wextra)
+
 set(FREESWITCH_MOD_DIR "/usr/local/freeswitch/mod"
     CACHE PATH "FreeSWITCH module install directory")
 

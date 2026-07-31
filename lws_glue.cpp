@@ -20,6 +20,13 @@
 #include "parser.hpp"
 #include "mod_audio_fork.h"
 #include "ws_uri.hpp"
+#include "drop_throttle.hpp"
+#include <inttypes.h>
+
+/* ★ How many skipped frames between reports. 500 ≈ 10s at 50 frames/s.
+ *   Counted in frames rather than milliseconds so the audio path needs no
+ *   clock syscall — see the else-branch in fork_frame. */
+#define FRAME_DROP_REPORT_EVERY 500
 #include "audio_pipe.hpp"
 
 #define RTP_PACKETIZATION_PERIOD 20
@@ -389,6 +396,20 @@ namespace {
     tech_pvt->channels = channels;
     tech_pvt->id = ++idxCallCount;
     tech_pvt->buffer_overrun_notified = 0;
+    /* PR-2 report throttle. ★ Guard against 0: it would fire an event on every
+     *   single skipped frame, and at 50 fps × N sessions that turns the
+     *   measurement into the bottleneck it is measuring. */
+    tech_pvt->dropReportEvery = FRAME_DROP_REPORT_EVERY;
+    {
+      const char *v = switch_channel_get_variable(
+        switch_core_session_get_channel(session), "MOD_AUDIO_FORK_DROP_REPORT_EVERY");
+      if (v) {
+        long n = atol(v);
+        if (n > 0) tech_pvt->dropReportEvery = (uint64_t) n;
+        else switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+          "MOD_AUDIO_FORK_DROP_REPORT_EVERY=%s ignored (must be > 0)\n", v);
+      }
+    }
     tech_pvt->audio_paused = 0;
     tech_pvt->graceful_shutdown = 0;
     tech_pvt->bidirectional_audio_enable = bidirectional_audio_enable;
@@ -796,6 +817,45 @@ extern "C" {
 
       pAudioPipe->unlockAudioBuffer();
       switch_mutex_unlock(tech_pvt->mutex);
+    }
+    else {
+      /* ════════════════════════════════════════════════════════════════════
+       * ★★★ PR-2: this branch did not exist — the dropped frame was invisible
+       * ════════════════════════════════════════════════════════════════════
+       *
+       * A10: a failed trylock skips one drain; the backlog is read on the next
+       * successful acquire. So this is jitter, not lost audio. But at 50
+       * frames/s per session it is exactly the signal PR-5/PR-6 would be trying
+       * to improve, and there was no way to count it.
+       *
+       * ⚠ THROTTLED, and it has to be: 50 frames/s × N sessions firing an event
+       *   per drop would push the contention into the event system itself —
+       *   the measurement would become the problem.
+       *
+       * ★ The throttle counts FRAMES, not milliseconds: this is the audio
+       *   callback, and a clock syscall here is exactly the kind of thing we are
+       *   trying to measure. FRAME_DROP_REPORT_EVERY frames ≈ 10s at 50 fps.
+       *
+       * ★★ The event carries the **cumulative** count, not "1". A consumer that
+       *   only sees increments cannot tell a throttled stream of reports from a
+       *   burst, and cannot recover after a missed event. */
+      tech_pvt->framesDroppedLock++;
+      /* ★ 判据走 drop_throttle.hpp 的那个纯函数 —— 各写一遍的话单测验的是
+       *   另一份实现（与 listExpiredMonths / tailPredicate 同一条理由）。 */
+      if (mod_af_should_report_drop(tech_pvt->framesDroppedLock,
+                                    tech_pvt->lastDropReportedAt,
+                                    tech_pvt->dropReportEvery,
+                                    FRAME_DROP_REPORT_EVERY)) {
+        char buf[128];
+        tech_pvt->lastDropReportedAt = tech_pvt->framesDroppedLock;
+        snprintf(buf, sizeof(buf),
+          "{\"frames_dropped_total\":%" PRIu64 ",\"reason\":\"trylock\"}",
+          tech_pvt->framesDroppedLock);
+        tech_pvt->responseHandler(session, EVENT_FRAME_DROPPED, buf);
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+          "(%u) mod_audio_fork: %" PRIu64 " frames skipped on mutex contention\n",
+          tech_pvt->id, tech_pvt->framesDroppedLock);
+      }
     }
     return SWITCH_TRUE;
   }

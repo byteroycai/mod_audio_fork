@@ -6,6 +6,8 @@ don't try to mock libfreeswitch.
 | Layer | File | What it covers | Runtime |
 |---|---|---|---|
 | Unit | [ws_uri_test.cpp](ws_uri_test.cpp) | URI parsing, 44 table-driven cases. No FS dependency — run by smoke.sh step 1b | ~1s |
+| Unit | [throttle_test.cpp](throttle_test.cpp) | PR-2 drop-report throttle arithmetic, 16 cases. Header-only, links nothing | <1s |
+| Contention | [contention_test.sh](contention_test.sh) | PR-2: provoke mutex contention and assert it is counted. ⚠ **SKIPs on this hardware** — see below | ~15s |
 | Smoke | [smoke.sh](smoke.sh) | Build, unit tests, .so symbols, module install + load, API surface, bad-input handling | ~40s |
 | Protocol | [protocol_test.sh](protocol_test.sh) | End-to-end wire protocol against a mock WS peer | ~15s |
 
@@ -50,6 +52,29 @@ resolvable.
 ⇒ Fixed: `BASE_IMAGE` is derived from `FS_CONTAINER`'s image so "compiled
 against" and "loaded into" cannot drift apart, and `BUILDER_IMAGE` carries the
 base in its tag so switching bases cannot reuse the wrong builder.
+
+## ⚠⚠ PR-2's drop counter is verified by construction, NOT by observation
+
+`contention_test.sh` **cannot provoke contention on this hardware.** Measured:
+6000 flooded `clearMarks` → 0 skipped frames; 400 × 32KB flooded `playAudio` →
+0 skipped frames. The mutex is held for microseconds while `fork_frame` only
+retries every 20ms, so the trylock never loses. That agrees with S2' (0.03ms
+jitter at 10 concurrent sessions, no inflection point) — and it is exactly why
+PR-5/6/7 were dropped from the roadmap.
+
+⇒ The script **SKIPs** rather than fails, because a permanently-red test trains
+people to ignore it. But it distinguishes the two causes first: if the
+else-branch in `fork_frame` is gone it **FAILs** (grep on `lws_glue.cpp`), since
+"the counter was deleted" is a different thing from "this machine has no
+contention". Verified by mutation: changing that log string turns the SKIP into
+a FAIL.
+
+**What is covered**: the throttle arithmetic (`throttle_test.cpp`, 16 cases
+including the `every == 0` guard that must fall back rather than fire on every
+frame) and the presence of the counting branch.
+
+**What is NOT covered**: that a real trylock failure reaches the counter. It has
+never been observed firing. ⇒ Do not report PR-2 as "verified end to end".
 
 **★ And a fourth, about mutation testing rather than the harness:** two
 mutations written as `else if (0) { } else if (...)` were folded away by the
