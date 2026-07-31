@@ -22,13 +22,35 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILDER_IMAGE="${BUILDER_IMAGE:-mod-audio-fork-builder:tmp}"
-BASE_IMAGE="${BASE_IMAGE:-voiceagent-fs:latest}"
 # The FS container to load the freshly-built module into.
 #
 #   Default is duck-call's (4th-gen) container; older generations used
 #   `voiceagent-fs`. Override with FS_CONTAINER=<name>.
 FS_CONTAINER="${FS_CONTAINER:-duckcall-fs}"
+
+# ════════════════════════════════════════════════════════════════════════════
+# ★★★ Build against the image you are going to LOAD INTO
+# ════════════════════════════════════════════════════════════════════════════
+#
+# BASE_IMAGE used to default to `voiceagent-fs:latest` (1st generation) while the
+# module was installed into `duckcall-fs` (4th generation) — two different
+# FreeSWITCH builds with two different `libfreeswitch.so.1`.
+#
+# ⚠ The failure mode is brutally unhelpful: FreeSWITCH reports
+#
+#     Error Loading module .../mod_audio_fork.so
+#     cannot open shared object file: No such file or directory
+#
+#   for a file that is plainly present with every NEEDED library resolvable.
+#   Hours can go into that message before suspecting the toolchain.
+#
+# ⇒ Derive the base from the container we install into, so "compiled against"
+#   and "loaded into" cannot drift apart. Override BASE_IMAGE to opt out.
+BASE_IMAGE="${BASE_IMAGE:-$(docker inspect -f '{{.Config.Image}}' "$FS_CONTAINER" 2>/dev/null)}"
+[ -n "$BASE_IMAGE" ] || BASE_IMAGE="voiceagent-fs:latest"
+# ★ The builder tag carries the base, so switching bases cannot silently reuse a
+#   builder compiled against the other one.
+BUILDER_IMAGE="${BUILDER_IMAGE:-mod-audio-fork-builder:$(printf '%s' "$BASE_IMAGE" | tr -c 'A-Za-z0-9_.-' '_')}"
 # Where the build lands on the host. `build/` is gitignored.
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
 MOD_PATH=/usr/local/freeswitch/mod/mod_audio_fork.so
@@ -51,7 +73,12 @@ if ! docker image inspect "$BUILDER_IMAGE" >/dev/null 2>&1; then
         fail "base image $BASE_IMAGE not found — build voiceagent-fs first \
 (deploy/fs/build.sh in the voice-agent repo)"
     fi
-    docker build -t "$BUILDER_IMAGE" -f - "$REPO_ROOT" <<EOF >/dev/null
+    # ★ DOCKER_BUILDKIT=0: buildkit's builder may run in its own container and
+    #   not share the local image store, so a LOCAL-only base image fails with
+    #   "pull access denied, repository does not exist". The legacy builder reads
+    #   the local store directly. (Measured: duckcall-fs:spike exists locally and
+    #   buildkit still tried to pull it from Docker Hub.)
+    DOCKER_BUILDKIT=0 docker build -t "$BUILDER_IMAGE" -f - "$REPO_ROOT" <<EOF >/dev/null
 FROM $BASE_IMAGE
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
@@ -92,6 +119,13 @@ COMBINED_OUT=$(docker run --rm -v "$REPO_ROOT:/src" -v "$BUILD_DIR:/out" "$BUILD
     cp /tmp/build/mod_audio_fork.so /out/mod_audio_fork.so
     echo "ARTIFACT_SIZE:$(stat -c%s /out/mod_audio_fork.so)"
     echo "ARTIFACT_SHA:$(sha256sum /out/mod_audio_fork.so | cut -d" " -f1)"
+    # ★ Run the ws_uri unit tests HERE, in the same container: the binary is a
+    #   Linux ELF and the host may be macOS. Its full output is echoed so a
+    #   failure shows which case broke, not just that something did.
+    test -x /tmp/build/ws_uri_test || { echo "UNIT_MISSING"; exit 1; }
+    echo "UNIT_BEGIN"
+    /tmp/build/ws_uri_test && echo "UNIT_RC:0" || echo "UNIT_RC:$?"
+    echo "UNIT_END"
     # FreeSWITCH discovers modules via the module_interface data symbol +
     # mod_load entry point. The interface lives in the data section (D),
     # the entry points in text (T) — accept either.
@@ -104,6 +138,29 @@ FRESH_SHA=$(echo "$COMBINED_OUT" | sed -n 's/^ARTIFACT_SHA://p')
 SO_SIZE=$(echo "$COMBINED_OUT" | sed -n 's/^ARTIFACT_SIZE://p')
 [ -z "$SO_SIZE" ] && fail "no .so produced"
 pass "built mod_audio_fork.so (${SO_SIZE} bytes)"
+
+# ----------------------------------------------------------------------------
+# 1b. ws_uri unit tests — the URL parser (PR-1).
+# ----------------------------------------------------------------------------
+bold "[1b] ws_uri unit tests"
+
+echo "$COMBINED_OUT" | grep -q "^UNIT_MISSING$" \
+    && fail "ws_uri_test was not built — is it still in CMakeLists.txt?"
+UNIT_RC=$(echo "$COMBINED_OUT" | sed -n 's/^UNIT_RC://p')
+UNIT_OUT=$(echo "$COMBINED_OUT" | sed -n '/^UNIT_BEGIN$/,/^UNIT_END$/p' | sed '1d;$d')
+[ -n "$UNIT_RC" ] || fail "no ws_uri_test result in the build output"
+if [ "$UNIT_RC" != "0" ]; then
+    printf '%s\n' "$UNIT_OUT"
+    fail "ws_uri_test exited $UNIT_RC"
+fi
+# ★★ COUNTER-PROOF: a suite that silently ran zero cases must not pass.
+#    The test binary self-checks this too (it refuses to report success under
+#    40 checks) — asserting it here as well means neither side can go vacuous
+#    alone. That matters because "0 checks, exit 0" is indistinguishable from
+#    "all checks passed" if you only look at the exit code.
+echo "$UNIT_OUT" | grep -qE '==> ws_uri: [0-9]+ checks passed' \
+    || fail "ws_uri_test exited 0 without the 'N checks passed' line — it may not have run its table"
+pass "ws_uri: $(echo "$UNIT_OUT" | sed -n 's/.*==> ws_uri: \([0-9]*\) checks passed.*/\1/p') checks passed"
 
 # ----------------------------------------------------------------------------
 # 2. Symbol check — module entry point present.
@@ -141,28 +198,70 @@ fs() { docker exec "$FS_CONTAINER" /usr/local/freeswitch/bin/fs_cli -p "$ESL_PW"
 #   Without this, everything below probes whatever was baked into the image.
 docker cp "$BUILD_DIR/mod_audio_fork.so" "$FS_CONTAINER:$MOD_PATH" \
     || fail "could not install the built .so into $FS_CONTAINER"
+# ★ Confirm it landed BEFORE restarting. `docker cp` into a running container
+#   is not atomic, and a restart that races it produces
+#   "cannot open shared object file: No such file or directory" — which reads
+#   like a broken build rather than a timing problem. (Measured: hit it once.)
+COPIED_SIZE=$(docker exec "$FS_CONTAINER" stat -c%s "$MOD_PATH" 2>/dev/null || echo 0)
+[ "$COPIED_SIZE" = "$SO_SIZE" ] || fail "the .so in $FS_CONTAINER is $COPIED_SIZE bytes, built $SO_SIZE
+  → docker cp did not complete; do not restart into a half-written module"
 
-# `reload` unloads + loads. On a module that is not currently loaded it still
-# loads it, so this covers both states.
-RELOAD=$(fs "reload mod_audio_fork")
-echo "$RELOAD" | grep -qiE '\+OK|Reload|success' \
-    || fail "reload mod_audio_fork failed: $RELOAD"
+# ════════════════════════════════════════════════════════════════════════════
+# ★★★ RESTART the container — `reload` is not enough, and it lies
+# ════════════════════════════════════════════════════════════════════════════
+#
+# The first version of this block did `fs "reload mod_audio_fork"` and accepted
+# the result if it matched /\+OK|Reload|success/i. Measured output:
+#
+#     +OK Reloading XML
+#     -ERR unloading module [Module in use.]
+#
+# The grep matched the FIRST line — which is about XML, not about the module —
+# while the unload had plainly failed. So:
+#
+#   · the new .so sat on disk,
+#   · the sha256 check below said "yes, that is the file I built",
+#   · and FreeSWITCH went on executing the OLD code from memory.
+#
+# ⇒ Steps 3-5 kept validating a stale module even after this harness was
+#   supposedly fixed to prevent exactly that. A file-level sha proves the FILE,
+#   never the RUNNING CODE. (Caught by a functional test: the parser rejected a
+#   port of 99999 in its unit tests while FS logged "port 99999" happily.)
+#
+# ★ `unload` fails with "Module in use." whenever any channel holds a media bug,
+#   which is most of the time. A container restart is deterministic, costs a few
+#   seconds, and removes the entire question.
+#   ⚠ It also drops live calls — acceptable for a test container, and a clean
+#     slate is what a smoke test wants anyway.
+#
+# ★★ The real answer to "is FS running my build?" is the module reporting its
+#    own identity — that is PR-3 (`audio_fork_version`). Until it exists, the
+#    restart is what makes the question answerable at all.
+docker restart "$FS_CONTAINER" >/dev/null || fail "could not restart $FS_CONTAINER"
+for _ in $(seq 60); do
+    STATE=$(docker inspect -f '{{.State.Health.Status}}' "$FS_CONTAINER" 2>/dev/null || echo "")
+    [ "$STATE" = "healthy" ] && break
+    # No healthcheck configured? Fall back to "fs_cli answers".
+    [ -z "$STATE" ] && fs "status" 2>/dev/null | grep -q "^UP" && break
+    sleep 1
+done
+fs "status" | grep -q "^UP" || fail "$FS_CONTAINER did not come back up after restart"
 
 EXISTS=$(fs "module_exists mod_audio_fork" | tr -d '[:space:]')
-[ "$EXISTS" = "true" ] || fail "module_exists returned '$EXISTS' (expected 'true')"
+[ "$EXISTS" = "true" ] || fail "module_exists returned '$EXISTS' (expected 'true') after restart
+  → check modules.conf.xml actually loads mod_audio_fork"
 
-# ★★★ COUNTER-PROOF: the module FS just loaded must be the one we built.
-#
-#   Without this assertion "PASS: module loaded" cannot distinguish
-#   "my change loaded" from "the stale baked-in module loaded" — which is
-#   exactly the failure this whole block was written to remove.
+# ★ COUNTER-PROOF (necessary, not sufficient): the file FS just loaded from
+#   must be the one we built. Necessary because a wrong file means the wrong
+#   code; not sufficient because a file can match while stale code runs — which
+#   is why the restart above is not optional.
 IN_CONTAINER_SHA=$(docker exec "$FS_CONTAINER" sha256sum "$MOD_PATH" 2>/dev/null | cut -d' ' -f1)
 [ "$IN_CONTAINER_SHA" = "$FRESH_SHA" ] || fail "the module in $FS_CONTAINER is NOT the one just built
   built:        $FRESH_SHA
   in container: $IN_CONTAINER_SHA
   ⇒ steps 3-5 would be validating a different binary (this is how the
     original harness silently tested a two-month-old module)."
-pass "freshly built module installed + loaded (sha ${FRESH_SHA:0:12}…)"
+pass "freshly built module installed, container restarted, module loaded (sha ${FRESH_SHA:0:12}…)"
 
 # ----------------------------------------------------------------------------
 # 4. API surface — USAGE banner mentions every subcommand.

@@ -181,6 +181,95 @@ pass "call answered: $CALL_UUID"
 #    mock running on the host. mono / 8000 / bugname / metadata{} / no
 #    bidirectional (one-way uplink).
 # ----------------------------------------------------------------------------
+# ════════════════════════════════════════════════════════════════════════════
+# ★★★ [2b] A rejected URI must not leave a media bug attached (PR-1)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# mod_audio_fork.c used to log a parse failure and call start_capture() anyway.
+# start_capture attaches the media bug BEFORE it connects:
+#
+#     fork_session_init(...)          <- accepts the garbage host
+#     switch_core_media_bug_add(...)  <- bug is now on the live channel
+#     switch_channel_set_private(...)
+#     fork_session_connect(...)       <- fails, returns FALSE, bug NOT removed
+#
+# ⇒ The real consequence of the missing guard is a **dangling media bug on a
+#   live call**: the audio path runs through capture_callback with a broken
+#   AudioPipe, and `-ERR` is all the operator sees.
+#
+# ★★★ MEASURED, not reasoned: without the guard a bad URI returns **+OK**.
+#
+#     I first assumed it would return -ERR either way (fork_session_connect
+#     failing on a garbage host). It does not — the lws connect is asynchronous,
+#     so start_capture runs to the end and reports success.
+#
+#     ⇒ The operator gets "+OK Success" — a confirmation that streaming
+#       started — and nothing ever streams. That is worse than the dangling
+#       bug: there is no error anywhere to go looking for.
+#
+# ★ So there are two assertions, and they fail in different worlds:
+#     · "+OK for a bad URI"      catches the fall-through directly
+#     · "the NEXT good start fails" catches the leaked media bug, which is what
+#       remains if someone ever makes the bad path return -ERR without also
+#       stopping before switch_core_media_bug_add
+#
+# ⚠ Verified by mutation: putting the fall-through back makes exactly this
+#   assertion red, and nothing else in either test script notices.
+bold "[2b] rejected URI leaves no media bug"
+
+BAD_OUT=$(docker exec "$FS_CONTAINER" fs_cli -p "$ESL_PASS" -x \
+    "uuid_audio_fork $CALL_UUID start ws://h:99999/test mono 8000 testbug {}" 2>&1)
+echo "$BAD_OUT" | grep -q "^+OK" \
+    && fail "an out-of-range port was accepted: $BAD_OUT"
+
+# The sample-rate gate, with two layers of assertion.
+#
+# ★ MEASURED: deleting `sampling % 8000 != 0` makes an illegal rate return
+#   **+OK Success**. The resampler does NOT refuse 7000 — so this is the same
+#   shape as the URI bug: silently accepted, nothing streams correctly.
+#   ⇒ The response check below is what kills that mutation.
+#
+# ⚠ I got here after being wrong twice. First I assumed the resampler would
+#   refuse and the response could not distinguish (it can). Before that I ran
+#   two mutations written as `else if (0) { } else if (...)`, which the compiler
+#   folds away entirely — the .so came out **byte-identical** and the "surviving"
+#   mutation had never landed. The sha256 in smoke.sh is what exposed that.
+#   ★ Lesson worth keeping: a mutation is only evidence once you have seen the
+#     artifact change. Reasoning about what a compiler or a downstream library
+#     will do is not measurement.
+#
+# ★★ The log assertion stays as a second layer: it pins that start_capture is
+#    never ENTERED with an illegal rate (its first statement logs
+#    "streaming <rate> sampling to ..."). Without it, a future change that
+#    returns -ERR *after* handing 7000 to the resampler would pass.
+BAD_RATE_OUT=$(docker exec "$FS_CONTAINER" fs_cli -p "$ESL_PASS" -x \
+    "uuid_audio_fork $CALL_UUID start ws://host.docker.internal:$PORT/test mono 7000 testbug {}" 2>&1)
+echo "$BAD_RATE_OUT" | grep -q "^+OK" \
+    && fail "a sample rate that is not a multiple of 8000 was accepted: $BAD_RATE_OUT"
+sleep 0.5
+if docker logs "$FS_CONTAINER" --since 15s 2>&1 | grep -q "streaming 7000 sampling"; then
+    fail "start_capture was entered with sampling=7000
+  ⇒ the 'sampling % 8000' guard did not stop it. Even if the API happened to
+    return -ERR, the illegal rate reached the resampler — the failure is then
+    two layers away from the bad argument, and which layer refuses is an
+    accident rather than a decision."
+fi
+
+# ★ The load-bearing assertion: neither rejection may have attached anything.
+PROBE=$(docker exec "$FS_CONTAINER" fs_cli -p "$ESL_PASS" -x \
+    "uuid_audio_fork $CALL_UUID start ws://host.docker.internal:$PORT/test mono 8000 testbug {}" 2>&1)
+if ! echo "$PROBE" | grep -q "^+OK"; then
+    fail "a good start after two rejected ones failed: $PROBE
+  ⇒ one of the rejected attempts left a media bug named 'testbug' attached to
+    the live channel (start_capture refuses an already-attached bugname).
+    That is the fall-through this guard removes — see mod_audio_fork.c."
+fi
+# Detach it again so step 3 starts from a clean channel.
+docker exec "$FS_CONTAINER" fs_cli -p "$ESL_PASS" -x \
+    "uuid_audio_fork $CALL_UUID stop testbug" >/dev/null 2>&1
+sleep 0.5
+pass "bad port + bad sample rate both refused, and neither leaked a bug"
+
 bold "[3/4] uuid_audio_fork start"
 
 FORK_OUT=$(docker exec "$FS_CONTAINER" fs_cli -p "$ESL_PASS" -x \

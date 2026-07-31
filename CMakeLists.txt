@@ -60,6 +60,7 @@ add_library(mod_audio_fork MODULE
     lws_glue.cpp
     parser.cpp
     audio_pipe.cpp
+    ws_uri.cpp
 )
 
 set_target_properties(mod_audio_fork PROPERTIES
@@ -81,6 +82,19 @@ target_link_libraries(mod_audio_fork PRIVATE
 )
 
 target_compile_options(mod_audio_fork PRIVATE -Wall -Wextra)
+
+# ── unit tests ─────────────────────────────────────────────────────────────
+#
+# ws_uri.cpp has no FreeSWITCH / libwebsockets dependency, so its tests link
+# against nothing and run in a couple of seconds. That is why the parser was
+# split out of lws_glue.cpp — a translation unit that pulls in switch.h cannot
+# be exercised without a whole FS install.
+#
+# ★ Built by default (it is cheap) so `cmake --build` cannot leave it stale,
+#   and run by tests/smoke.sh.
+add_executable(ws_uri_test tests/ws_uri_test.cpp ws_uri.cpp)
+target_include_directories(ws_uri_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(ws_uri_test PRIVATE -Wall -Wextra)
 
 set(FREESWITCH_MOD_DIR "/usr/local/freeswitch/mod"
     CACHE PATH "FreeSWITCH module install directory")

@@ -11,7 +11,6 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
-#include <regex>
 #include <deque>
 #include <vector>
 
@@ -20,6 +19,7 @@
 #include "base64.hpp"
 #include "parser.hpp"
 #include "mod_audio_fork.h"
+#include "ws_uri.hpp"
 #include "audio_pipe.hpp"
 
 #define RTP_PACKETIZATION_PERIOD 20
@@ -500,10 +500,11 @@ namespace {
 
 extern "C" {
   int parse_ws_uri(switch_channel_t *channel, const char* szServerUri, char* host, char *path, unsigned int* pPort, int* pSslFlags) {
-    int offset;
-    char server[MAX_WS_URL_LEN + MAX_PATH_LEN];
+    size_t offset = 0;
+    int secure = 0;
     int flags = LCCSCF_USE_SSL;
-    
+    const char *err = 0;
+
     if (switch_true(switch_channel_get_variable(channel, "MOD_AUDIO_FORK_ALLOW_SELFSIGNED"))) {
       switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "parse_ws_uri - allowing self-signed certs\n");
       flags |= LCCSCF_ALLOW_SELFSIGNED;
@@ -517,58 +518,33 @@ extern "C" {
       flags |= LCCSCF_ALLOW_EXPIRED;
     }
 
-    // get the scheme
-    strncpy(server, szServerUri, MAX_WS_URL_LEN + MAX_PATH_LEN - 1);
-    server[MAX_WS_URL_LEN + MAX_PATH_LEN - 1] = '\0';
-    if (0 == strncmp(server, "https://", 8) || 0 == strncmp(server, "HTTPS://", 8)) {
-      *pSslFlags = flags;
-      offset = 8;
-      *pPort = 443;
-    }
-    else if (0 == strncmp(server, "wss://", 6) || 0 == strncmp(server, "WSS://", 6)) {
-      *pSslFlags = flags;
-      offset = 6;
-      *pPort = 443;
-    }
-    else if (0 == strncmp(server, "http://", 7) || 0 == strncmp(server, "HTTP://", 7)) {
-      offset = 7;
-      *pSslFlags = 0;
-      *pPort = 80;
-    }
-    else if (0 == strncmp(server, "ws://", 5) || 0 == strncmp(server, "WS://", 5)) {
-      offset = 5;
-      *pSslFlags = 0;
-      *pPort = 80;
-    }
-    else {
-      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "parse_ws_uri - error parsing uri %s: invalid scheme\n", szServerUri);;
+    if (!szServerUri || !ws_uri_scheme(szServerUri, &offset, &secure, pPort)) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+        "parse_ws_uri - error parsing uri %s: invalid scheme (want ws/wss/http/https)\n",
+        szServerUri ? szServerUri : "(null)");
+      /* ★ Zero the caller's buffers on every failure path — see ws_uri.hpp. */
+      host[0] = '\0';
+      path[0] = '\0';
       return 0;
     }
+    *pSslFlags = secure ? flags : 0;
 
-    std::string strHost(server + offset);
-    std::regex re("^(.+?):?(\\d+)?(/.*)?$");
-    std::smatch matches;
-    if(std::regex_search(strHost, matches, re)) {
-      /*
-      for (int i = 0; i < matches.length(); i++) {
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "parse_ws_uri - %d: %s\n", i, matches[i].str().c_str());
-      }
-      */
-      strncpy(host, matches[1].str().c_str(), MAX_WS_URL_LEN);
-      if (matches[2].str().length() > 0) {
-        *pPort = atoi(matches[2].str().c_str());
-      }
-      if (matches[3].str().length() > 0) {
-        strncpy(path, matches[3].str().c_str(), MAX_PATH_LEN);
-      }
-      else {
-        strcpy(path, "/");
-      }
-    } else {
-      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "parse_ws_uri - invalid format %s\n", strHost.c_str());
+    /* ★★★ The parsing itself lives in ws_uri.cpp, which has no FreeSWITCH or
+     *     libwebsockets dependency. That split is what makes tests/ws_uri_test.cpp
+     *     possible (44 table-driven cases) — the std::regex it replaced could
+     *     only ever be exercised by starting a whole FreeSWITCH.
+     *
+     * ⚠ The buffer sizes are the CALLER's, and they are what the fixed-size
+     *   stack arrays in mod_audio_fork.c declare. Passing anything larger here
+     *   re-opens the overflow the old strncpy had. */
+    if (!ws_uri_parse_authority(szServerUri + offset, host, MAX_WS_URL_LEN,
+                                path, MAX_PATH_LEN, pPort, &err)) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+        "parse_ws_uri - invalid uri %s: %s\n", szServerUri, err ? err : "unparseable");
       return 0;
     }
-    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "parse_ws_uri - host %s, path %s\n", host, path);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+      "parse_ws_uri - host %s, port %u, path %s\n", host, *pPort, path);
 
     return 1;
   }

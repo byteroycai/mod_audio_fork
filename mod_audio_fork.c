@@ -249,7 +249,11 @@ SWITCH_STANDARD_API(fork_function)
       }
       else if (!strcasecmp(argv[1], "start")) {
 				switch_channel_t *channel = switch_core_session_get_channel(lsession);
-        char host[MAX_WS_URL_LEN], path[MAX_PATH_LEN];
+        /* ★ Initialised at declaration: the third layer. parse_ws_uri zeroes
+         * them on failure and the guard below stops on failure — but a stack
+         * array whose first byte is never written is a landmine regardless of
+         * who is supposed to step around it. */
+        char host[MAX_WS_URL_LEN] = {0}, path[MAX_PATH_LEN] = {0};
         unsigned int port;
         int sslFlags;
         int sampling = 8000;
@@ -258,6 +262,9 @@ SWITCH_STANDARD_API(fork_function)
         int bidirectional_audio_enable = 0;
         int bidirectional_audio_stream = 0;
         int bidirectional_audio_sample_rate = 0;
+        /* Set by any argument-validation branch below. ★ We keep going to the
+         * common rwunlock + status write instead of jumping past them. */
+        int bad_args = 0;
         // Three layered argument shapes for backward compatibility:
         //   argc > 9  : ... bugname metadata bidir stream rate
         //   argc > 7  : ... bugname metadata bidir
@@ -295,8 +302,11 @@ SWITCH_STANDARD_API(fork_function)
         }
         else if(0 != strcmp(argv[3], "mono")) {
           switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "invalid mix type: %s, must be mono, mixed, or stereo\n", argv[3]);
-          switch_core_session_rwunlock(lsession);
-          goto done;
+          /* ⚠ This used to `switch_core_session_rwunlock(lsession); goto done;`
+           * — and `done:` sits AFTER the +OK/-ERR write, so the caller got an
+           * empty response for an invalid mix type. Same defect as the URI
+           * branch below; found while fixing that one. */
+          bad_args = 1;
         }
         if (0 == strcmp(argv[4], "16k")) {
           sampling = 16000;
@@ -307,15 +317,53 @@ SWITCH_STANDARD_API(fork_function)
 				else {
 					sampling = atoi(argv[4]);
 				}
-        if (!parse_ws_uri(channel, argv[2], &host[0], &path[0], &port, &sslFlags)) {
-          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "invalid websocket uri: %s\n", argv[2]);
+        /* ════════════════════════════════════════════════════════════════
+         * ★★★ Both of these used to log and then fall through
+         * ════════════════════════════════════════════════════════════════
+         *
+         * The original was:
+         *
+         *     if (!parse_ws_uri(...)) { log("invalid websocket uri"); }
+         *     else if (sampling % 8000 != 0) { log("invalid sample rate"); }
+         *     status = start_capture(..., host, port, path, sampling, ...);
+         *
+         * There was no `else` on that last statement, so start_capture ran
+         * unconditionally:
+         *
+         *  · on a parse failure, `host` and `path` are the fixed-size stack
+         *    arrays declared above and **not one byte of them had been
+         *    written** ⇒ uninitialised stack memory used as the target of a
+         *    network connection.
+         *  · on an illegal sample rate, we logged the error and then used the
+         *    illegal rate anyway.
+         *
+         * ⚠ Both failures are quiet: the log line scrolls past and the module
+         *   goes on to do something. That is docs/CONSTRAINTS.md A4/A5.
+         *
+         * ★ parse_ws_uri now also zeroes host/path on every failure path, so
+         *   even a future caller that forgets this guard cannot read junk —
+         *   two layers, because this one is the layer that already failed once.
+         */
+        /* ★★★ else-if chain, NOT `goto done` — see the note above `done:`.
+         *
+         * `status` is SWITCH_STATUS_FALSE at declaration, so simply not calling
+         * start_capture is what produces `-ERR Operation Failed`. */
+        if (bad_args) {
+          /* already logged above; fall through to the -ERR write */
         }
-				else if (sampling % 8000 != 0) {
-          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "invalid sample rate: %s\n", argv[4]);
-				}
-        status = start_capture(lsession, flags, host, port, path, sampling, sslFlags,
-          bidirectional_audio_enable, bidirectional_audio_stream, bidirectional_audio_sample_rate,
-          bugname, metadata);
+        else if (!parse_ws_uri(channel, argv[2], &host[0], &path[0], &port, &sslFlags)) {
+          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+            "invalid websocket uri: %s — not starting capture\n", argv[2]);
+        }
+        else if (sampling % 8000 != 0) {
+          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+            "invalid sample rate: %s (must be a multiple of 8000) — not starting capture\n", argv[4]);
+        }
+        else {
+          status = start_capture(lsession, flags, host, port, path, sampling, sslFlags,
+            bidirectional_audio_enable, bidirectional_audio_stream, bidirectional_audio_sample_rate,
+            bugname, metadata);
+        }
 			}
       else {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "unsupported mod_audio_fork cmd: %s\n", argv[1]);
@@ -333,6 +381,22 @@ SWITCH_STANDARD_API(fork_function)
 		stream->write_function(stream, "-ERR Operation Failed\n");
 	}
 
+  /* ════════════════════════════════════════════════════════════════════════
+   * ★★★ `done:` is AFTER the +OK/-ERR write — jumping here skips the response
+   * ════════════════════════════════════════════════════════════════════════
+   *
+   * It exists only to free `mycmd` on the early argument-count failures, which
+   * happen before `stream` has anything to say.
+   *
+   * ⚠ Any validation failure that happens INSIDE the command handlers must NOT
+   *   `goto done`: the caller then gets an empty body, which the API layer
+   *   renders as a success. Leave `status` at SWITCH_STATUS_FALSE and fall
+   *   through to the write instead.
+   *
+   * ★ Both the invalid-mix-type branch and (briefly) the new URI guard got this
+   *   wrong. It is an easy mistake precisely because `goto done` is right there
+   *   in the same function and looks like the local idiom.
+   */
   done:
 
 	switch_safe_free(mycmd);
