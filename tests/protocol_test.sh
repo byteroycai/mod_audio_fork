@@ -24,7 +24,17 @@ PORT="${MOCK_PORT:-9099}"
 LOG="/tmp/mod_audio_fork_mock_$$.log"
 MOCK_PID=""
 CALL_UUID=""
-ESL_PASS="${FS_ESL_PASSWORD:-ClueCon}"
+# The FS container. Default is duck-call's (4th-gen); older generations used
+# `voiceagent-fs`. Override with FS_CONTAINER=<name>.
+FS_CONTAINER="${FS_CONTAINER:-duckcall-fs}"
+BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
+MOD_PATH=/usr/local/freeswitch/mod/mod_audio_fork.so
+# The ESL password comes from the container's own env — hardcoding ClueCon only
+# works on a factory-default FS, and a wrong password fails as a wall of -ERR
+# whose root cause is invisible.
+ESL_PASS=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$FS_CONTAINER" 2>/dev/null \
+    | sed -n 's/^FS_ESL_PASSWORD=//p' | head -1)
+[ -n "$ESL_PASS" ] || ESL_PASS="${FS_ESL_PASSWORD:-ClueCon}"
 TEST_EXT=7900   # dialplan extension we install for the duration of the test
 TEST_DIALPLAN_PATH=/usr/local/freeswitch/conf/dialplan/default/99_mod_audio_fork_test.xml
 
@@ -35,15 +45,15 @@ bold()  { printf "\033[1m%s\033[0m\n" "$*"; }
 cleanup() {
     local code=$?
     if [ -n "$CALL_UUID" ]; then
-        docker exec voiceagent-fs fs_cli -p "$ESL_PASS" -x "uuid_kill $CALL_UUID" >/dev/null 2>&1 || true
+        docker exec "$FS_CONTAINER" fs_cli -p "$ESL_PASS" -x "uuid_kill $CALL_UUID" >/dev/null 2>&1 || true
     fi
     if [ -n "$MOCK_PID" ] && kill -0 "$MOCK_PID" 2>/dev/null; then
         kill "$MOCK_PID" 2>/dev/null || true
         wait "$MOCK_PID" 2>/dev/null || true
     fi
     # Remove the test-only dialplan we installed.
-    docker exec voiceagent-fs rm -f "$TEST_DIALPLAN_PATH" 2>/dev/null || true
-    docker exec voiceagent-fs fs_cli -p "$ESL_PASS" -x "reloadxml" >/dev/null 2>&1 || true
+    docker exec "$FS_CONTAINER" rm -f "$TEST_DIALPLAN_PATH" 2>/dev/null || true
+    docker exec "$FS_CONTAINER" fs_cli -p "$ESL_PASS" -x "reloadxml" >/dev/null 2>&1 || true
     if [ $code -ne 0 ]; then
         red "FAILED — mock log preserved at: $LOG"
     else
@@ -80,8 +90,38 @@ print(total)
 # ----------------------------------------------------------------------------
 # Preflight.
 # ----------------------------------------------------------------------------
-docker inspect voiceagent-fs --format '{{.State.Status}}' 2>/dev/null | grep -q running \
-    || fail "voiceagent-fs container not running"
+docker inspect "$FS_CONTAINER" --format '{{.State.Status}}' 2>/dev/null | grep -q running \
+    || fail "FS container '$FS_CONTAINER' not running.
+  Running: $(docker ps --format '{{.Names}}' | tr '\n' ' ')
+  → start one (duck-call: 'make fs-up') or set FS_CONTAINER=<name>."
+
+# ════════════════════════════════════════════════════════════════════════════
+# ★★★ Say WHICH binary this run exercises — do not leave it implied
+# ════════════════════════════════════════════════════════════════════════════
+#
+# This script probes whatever module the running FS currently has loaded. It
+# does not build anything, so on its own it cannot tell you that your change is
+# being tested. That is exactly how the sibling smoke.sh silently validated a
+# two-month-old module for months.
+#
+#   · smoke.sh ran first  ⇒ build/mod_audio_fork.so exists ⇒ assert they match
+#   · it did not          ⇒ say so loudly rather than imply freshness
+LOADED_SHA=$(docker exec "$FS_CONTAINER" sha256sum "$MOD_PATH" 2>/dev/null | cut -d' ' -f1)
+if [ -f "$BUILD_DIR/mod_audio_fork.so" ]; then
+    BUILT_SHA=$(shasum -a 256 "$BUILD_DIR/mod_audio_fork.so" 2>/dev/null | cut -d' ' -f1)
+    [ -n "$BUILT_SHA" ] || BUILT_SHA=$(sha256sum "$BUILD_DIR/mod_audio_fork.so" | cut -d' ' -f1)
+    if [ "$LOADED_SHA" != "$BUILT_SHA" ]; then
+        fail "the loaded module is NOT the last one built
+  built (build/):  $BUILT_SHA
+  loaded in FS:    $LOADED_SHA
+  ⇒ this run would exercise a different binary than the one you just built.
+    → run ./tests/smoke.sh first (it installs + reloads the fresh module)."
+    fi
+    green "testing the freshly built module (sha ${BUILT_SHA:0:12}…)"
+else
+    bold "⚠ no build/ artifact — testing whatever FS has loaded (sha ${LOADED_SHA:0:12}…)"
+    bold "  run ./tests/smoke.sh first if you want your change under test."
+fi
 
 python3 -c "import websockets" 2>/dev/null \
     || fail "python websockets package missing — pip install websockets"
@@ -116,7 +156,7 @@ pass "mock listening (pid $MOCK_PID)"
 # ----------------------------------------------------------------------------
 bold "[2/4] Install test dialplan + originate"
 
-docker exec -i voiceagent-fs sh -c "cat > $TEST_DIALPLAN_PATH" <<EOF
+docker exec -i "$FS_CONTAINER" sh -c "cat > $TEST_DIALPLAN_PATH" <<EOF
 <include>
   <extension name="mod_audio_fork_test_silence">
     <condition field="destination_number" expression="^$TEST_EXT\$">
@@ -127,9 +167,9 @@ docker exec -i voiceagent-fs sh -c "cat > $TEST_DIALPLAN_PATH" <<EOF
   </extension>
 </include>
 EOF
-docker exec voiceagent-fs fs_cli -p "$ESL_PASS" -x "reloadxml" >/dev/null
+docker exec "$FS_CONTAINER" fs_cli -p "$ESL_PASS" -x "reloadxml" >/dev/null
 
-ORIG_OUT=$(docker exec voiceagent-fs fs_cli -p "$ESL_PASS" -x \
+ORIG_OUT=$(docker exec "$FS_CONTAINER" fs_cli -p "$ESL_PASS" -x \
     "originate loopback/$TEST_EXT/default &park" 2>&1)
 echo "$ORIG_OUT" | grep -q "^+OK" || fail "originate failed: $ORIG_OUT"
 CALL_UUID=$(echo "$ORIG_OUT" | awk '/^\+OK/ {print $2; exit}')
@@ -143,7 +183,7 @@ pass "call answered: $CALL_UUID"
 # ----------------------------------------------------------------------------
 bold "[3/4] uuid_audio_fork start"
 
-FORK_OUT=$(docker exec voiceagent-fs fs_cli -p "$ESL_PASS" -x \
+FORK_OUT=$(docker exec "$FS_CONTAINER" fs_cli -p "$ESL_PASS" -x \
     "uuid_audio_fork $CALL_UUID start ws://host.docker.internal:$PORT/test mono 8000 testbug {}" 2>&1)
 echo "$FORK_OUT" | grep -q "^+OK" || fail "uuid_audio_fork start did not return +OK: $FORK_OUT"
 pass "uuid_audio_fork start -> +OK"
@@ -155,7 +195,7 @@ sleep 4
 # Stop the fork and verify the media bug is detached cleanly — concretely,
 # that no further binary frames arrive after the stop command returns.
 FRAMES_BEFORE_STOP=$(count_event RECV_BINARY)
-STOP_OUT=$(docker exec voiceagent-fs fs_cli -p "$ESL_PASS" -x \
+STOP_OUT=$(docker exec "$FS_CONTAINER" fs_cli -p "$ESL_PASS" -x \
     "uuid_audio_fork $CALL_UUID stop testbug" 2>&1)
 echo "$STOP_OUT" | grep -q "^+OK" || fail "uuid_audio_fork stop did not return +OK: $STOP_OUT"
 
@@ -199,7 +239,7 @@ pass "binary audio frames flowed (${FRAMES_BEFORE_STOP} frames, ${BIN_BYTES} byt
 pass "media bug detached cleanly (${DRAINED_AFTER_STOP} drain frame(s), then frozen)"
 
 # Module + FS still alive — module didn't crash the container.
-HEALTH=$(docker inspect voiceagent-fs --format '{{.State.Health.Status}}' 2>/dev/null || echo "")
+HEALTH=$(docker inspect "$FS_CONTAINER" --format '{{.State.Health.Status}}' 2>/dev/null || echo "")
 [ "$HEALTH" = "healthy" ] || fail "FS unhealthy after test ($HEALTH)"
 pass "FS still healthy"
 
