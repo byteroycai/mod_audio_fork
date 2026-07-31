@@ -5,16 +5,67 @@ don't try to mock libfreeswitch.
 
 | Layer | File | What it covers | Runtime |
 |---|---|---|---|
-| Smoke | [smoke.sh](smoke.sh) | Build, .so symbols, module load, API surface, bad-input handling | ~10s |
-| Protocol | [protocol_test.sh](protocol_test.sh) | End-to-end wire protocol against a mock WS peer | ~12s |
+| Unit | [ws_uri_test.cpp](ws_uri_test.cpp) | URI parsing, 44 table-driven cases. No FS dependency — run by smoke.sh step 1b | ~1s |
+| Smoke | [smoke.sh](smoke.sh) | Build, unit tests, .so symbols, module install + load, API surface, bad-input handling | ~40s |
+| Protocol | [protocol_test.sh](protocol_test.sh) | End-to-end wire protocol against a mock WS peer | ~15s |
+
+## ★★★ Three ways this suite used to lie — read before trusting a green run
+
+All three were found in one sitting while writing PR-1, and all three produce
+**all-PASS output while testing something other than what you changed.**
+
+**① The build artifact was thrown away.** `smoke.sh` compiled the module inside
+a `docker run --rm` container and extracted only its size and `nm` output. Steps
+3-5 then `docker exec`'d into a running FS and probed the module **baked into
+that image**. Measured: the container's .so was 239,120 bytes dated May 25 while
+step 1 had just produced 323,008 bytes. Two different binaries, two months apart.
+⇒ Fixed: the build lands on the host, is installed into the container, and a
+sha256 comparison is asserted.
+
+**② `reload mod_audio_fork` reports success while failing.** Its real output is
+
+    +OK Reloading XML
+    -ERR unloading module [Module in use.]
+
+The first line is about XML. The old assertion grepped for `/\+OK|Reload/i` and
+matched it, so the new .so sat on disk, the sha256 check said "that is the file I
+built", and FreeSWITCH kept executing the OLD code from memory. A file-level sha
+proves the FILE, never the RUNNING CODE.
+⇒ Fixed: the container is **restarted**, not reloaded. `unload` fails with
+"Module in use." whenever any channel holds a media bug, which is most of the
+time. Until PR-3 lands (`audio_fork_version`, a module that reports its own
+identity), the restart is what makes "is FS running my build?" answerable.
+
+**③ The builder image was a different FreeSWITCH than the target.** `BASE_IMAGE`
+defaulted to `voiceagent-fs:latest` (1st generation) while the module was
+installed into `duckcall-fs` (4th generation) — two FS builds, two different
+`libfreeswitch.so.1`. The symptom is a message that sends you looking in
+completely the wrong place:
+
+    Error Loading module /usr/local/freeswitch/mod/mod_audio_fork.so
+    cannot open shared object file: No such file or directory
+
+for a file that is present, owned correctly, with every NEEDED library
+resolvable.
+⇒ Fixed: `BASE_IMAGE` is derived from `FS_CONTAINER`'s image so "compiled
+against" and "loaded into" cannot drift apart, and `BUILDER_IMAGE` carries the
+base in its tag so switching bases cannot reuse the wrong builder.
+
+**★ And a fourth, about mutation testing rather than the harness:** two
+mutations written as `else if (0) { } else if (...)` were folded away by the
+compiler — the .so came out byte-identical and the mutations appeared to
+"survive". The sha256 from ① is what exposed it. A mutation is only evidence
+once the artifact has been seen to change.
 
 ## Prerequisites
 
 - Docker (for the FS container + isolated builder image)
-- `voiceagent-fs:latest` image already built — this gives us a FS with the
-  necessary SDK headers and matching `libfreeswitch.so`. Build it with
-  `voice-agent/deploy/fs/build.sh` if it's missing.
-- `voiceagent-fs` container running — `make fs-up` in voice-agent.
+- **A running FreeSWITCH container with mod_audio_fork registered.** Defaults to
+  `duckcall-fs` (duck-call: `make fs-up` in `deploy/fs`); override with
+  `FS_CONTAINER=<name>`. Older generations used `voiceagent-fs`.
+- The builder image is created automatically **from that container's image**, so
+  the SDK headers and `libfreeswitch.so` match what you load into. Override with
+  `BASE_IMAGE=<image>` only if you know why (see ③ above).
 - For the protocol test only: `python3` with the `websockets` package
   (`pip install websockets`).
 
@@ -37,7 +88,13 @@ at `/tmp/mod_audio_fork_mock_<pid>.log` on failure for postmortem.
 2. **Symbols**: `nm -D` shows `mod_audio_fork_module_interface`,
    `mod_audio_fork_load`, `mod_audio_fork_shutdown`. (FreeSWITCH won't
    load a module missing any of these.)
-3. **Module load**: `module_exists mod_audio_fork` returns `true`.
+1b. **Unit tests**: `ws_uri_test` runs its 44-case table. It refuses to report
+   success under 40 checks, and smoke.sh independently requires the
+   "N checks passed" line — neither side can go vacuous alone.
+3. **Module install + load**: the freshly built .so is copied in, the container
+   is **restarted**, `module_exists mod_audio_fork` returns `true`, and the
+   in-container sha256 matches what was just built. See ① ② ③ above for why each
+   of those three steps is load-bearing.
 4. **API surface**: the USAGE banner advertises every subcommand we
    ship (`start`, `stop`, `send_text`, `pause`, `resume`, `stop_play`,
    `graceful-shutdown`) and the three bidirectional-audio parameters.
@@ -55,6 +112,12 @@ Python mock WebSocket server running on the host.
 
 Assertions:
 
+0. **Rejected arguments leave no media bug** (step 2b) — an out-of-range port
+   and a sample rate that is not a multiple of 8000 must both be refused, and a
+   subsequent *good* start must still succeed. `start_capture` attaches the
+   media bug **before** it connects, so a validation failure that falls through
+   leaves a dangling bug on a live call. ★ Measured: without the guards both
+   bad inputs return **+OK Success** — see PR-1.
 1. **CONNECT** — the WS handshake succeeds with the
    `audio.drachtio.org` subprotocol.
 2. **Initial metadata** — the first text frame is the metadata blob
