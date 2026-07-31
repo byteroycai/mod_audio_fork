@@ -113,8 +113,15 @@ mkdir -p "$BUILD_DIR"
 COMBINED_OUT=$(docker run --rm -v "$REPO_ROOT:/src" -v "$BUILD_DIR:/out" "$BUILDER_IMAGE" bash -c '
     set -e
     rm -rf /tmp/build
-    cmake -S /src -B /tmp/build >/dev/null 2>&1
-    cmake --build /tmp/build --parallel >/dev/null 2>&1
+    # ★★★ 编译输出**不许丢**。原来两行都是 >/dev/null 2>&1，于是编译失败时
+    #   外层只能打印 `build / introspection failed (output: )` —— 括号里是空的。
+    #   ⚠ 实测撞到：PR-3 撞了一个既有函数名，而那条 `conflicting types` 被吞掉了，
+    #     我只能另起一个 docker run 才看到它。★ 一个不肯说原因的构建失败
+    #     比失败本身更贵。
+    cmake -S /src -B /tmp/build > /tmp/cmake_cfg.log 2>&1 \
+      || { echo "CMAKE_CONFIG_FAILED"; tail -30 /tmp/cmake_cfg.log; exit 1; }
+    cmake --build /tmp/build --parallel > /tmp/cmake_build.log 2>&1 \
+      || { echo "CMAKE_BUILD_FAILED"; grep -E "error|Error" /tmp/cmake_build.log | head -20; exit 1; }
     test -f /tmp/build/mod_audio_fork.so || { echo "NO_ARTIFACT"; exit 1; }
     cp /tmp/build/mod_audio_fork.so /out/mod_audio_fork.so
     echo "ARTIFACT_SIZE:$(stat -c%s /out/mod_audio_fork.so)"
@@ -122,9 +129,15 @@ COMBINED_OUT=$(docker run --rm -v "$REPO_ROOT:/src" -v "$BUILD_DIR:/out" "$BUILD
     # ★ Run the ws_uri unit tests HERE, in the same container: the binary is a
     #   Linux ELF and the host may be macOS. Its full output is echoed so a
     #   failure shows which case broke, not just that something did.
-    test -x /tmp/build/ws_uri_test || { echo "UNIT_MISSING"; exit 1; }
+    for u in ws_uri_test throttle_test json_escape_test; do
+      test -x /tmp/build/$u || { echo "UNIT_MISSING:$u"; exit 1; }
+    done
     echo "UNIT_BEGIN"
-    /tmp/build/ws_uri_test && echo "UNIT_RC:0" || echo "UNIT_RC:$?"
+    unit_rc=0
+    for u in ws_uri_test throttle_test json_escape_test; do
+      /tmp/build/$u || unit_rc=$?
+    done
+    echo "UNIT_RC:$unit_rc"
     echo "UNIT_END"
     # FreeSWITCH discovers modules via the module_interface data symbol +
     # mod_load entry point. The interface lives in the data section (D),
@@ -144,8 +157,8 @@ pass "built mod_audio_fork.so (${SO_SIZE} bytes)"
 # ----------------------------------------------------------------------------
 bold "[1b] ws_uri unit tests"
 
-echo "$COMBINED_OUT" | grep -q "^UNIT_MISSING$" \
-    && fail "ws_uri_test was not built — is it still in CMakeLists.txt?"
+MISSING=$(echo "$COMBINED_OUT" | sed -n 's/^UNIT_MISSING://p')
+[ -z "$MISSING" ] || fail "unit test binary '$MISSING' was not built — still in CMakeLists.txt?"
 UNIT_RC=$(echo "$COMBINED_OUT" | sed -n 's/^UNIT_RC://p')
 UNIT_OUT=$(echo "$COMBINED_OUT" | sed -n '/^UNIT_BEGIN$/,/^UNIT_END$/p' | sed '1d;$d')
 [ -n "$UNIT_RC" ] || fail "no ws_uri_test result in the build output"
@@ -154,13 +167,19 @@ if [ "$UNIT_RC" != "0" ]; then
     fail "ws_uri_test exited $UNIT_RC"
 fi
 # ★★ COUNTER-PROOF: a suite that silently ran zero cases must not pass.
-#    The test binary self-checks this too (it refuses to report success under
-#    40 checks) — asserting it here as well means neither side can go vacuous
-#    alone. That matters because "0 checks, exit 0" is indistinguishable from
-#    "all checks passed" if you only look at the exit code.
-echo "$UNIT_OUT" | grep -qE '==> ws_uri: [0-9]+ checks passed' \
-    || fail "ws_uri_test exited 0 without the 'N checks passed' line — it may not have run its table"
-pass "ws_uri: $(echo "$UNIT_OUT" | sed -n 's/.*==> ws_uri: \([0-9]*\) checks passed.*/\1/p') checks passed"
+#    Each binary self-checks a minimum count too — asserting it here as well
+#    means neither side can go vacuous alone. That matters because
+#    "0 checks, exit 0" is indistinguishable from "all checks passed" if you
+#    only look at the exit code.
+#
+# ⚠ And every suite must be named here explicitly: a `for` over whatever
+#   happened to print would pass when one of them printed nothing at all.
+for suite in ws_uri drop_throttle json_escape; do
+    line=$(echo "$UNIT_OUT" | grep -oE "==> $suite: [0-9]+ checks passed" | head -1)
+    [ -n "$line" ] || fail "no '==> $suite: N checks passed' line — that suite did not run its table
+  (exit code was 0, which on its own cannot tell 'all passed' from 'ran nothing')"
+    pass "$(echo "$line" | sed 's/==> //')"
+done
 
 # ----------------------------------------------------------------------------
 # 2. Symbol check — module entry point present.

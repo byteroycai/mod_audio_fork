@@ -5,6 +5,20 @@
 
 int parse_ws_uri(switch_channel_t *channel, const char* szServerUri, char* host, char *path, unsigned int* pPort, int* pSslFlags);
 
+/* PR-3: read back what the module actually configured itself with.
+ *
+ * ★ These are the **effective** values (after the env clamp), not what the env
+ *   asked for. `audio_fork_version` reports them so an operator can see the
+ *   difference: MOD_AUDIO_FORK_SERVICE_THREADS=9 clamps to 5, and finding that
+ *   out from a log line at startup is not the same as being able to ask.
+ */
+/* ⚠ 名字不能叫 fork_service_threads —— :32 那个已经被占了（它是 lws 服务循环的
+ *   启动器，由 mod_runtime 调，签名是 (int*)）。★ 撞名的症状是 C 编译器报
+ *   `conflicting types`，而那个报错指向我的声明行，读起来像我写错了类型。
+ */
+int fork_effective_threads(void);
+const char* fork_effective_subprotocol(void);
+
 switch_status_t fork_init();
 switch_status_t fork_cleanup();
 switch_status_t fork_session_init(switch_core_session_t *session, responseHandler_t responseHandler,

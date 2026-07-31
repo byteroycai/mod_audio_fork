@@ -21,6 +21,7 @@
 #include "mod_audio_fork.h"
 #include "ws_uri.hpp"
 #include "drop_throttle.hpp"
+#include "json_escape.hpp"
 #include <inttypes.h>
 
 /* ★ How many skipped frames between reports. 500 ≈ 10s at 50 frames/s.
@@ -60,15 +61,27 @@ namespace {
 
   /* Build and send a {"type":"mark","data":{"name":"...","event":"..."}}
    * frame back to the server. Caller may hold tech_pvt->mutex (the AudioPipe
-   * write path only acquires its own internal text mutex). The mark name is
-   * passed through verbatim; callers are responsible for ensuring it doesn't
-   * contain characters that break JSON (the server is the source of these
-   * names so this is normally already true). */
+   * write path only acquires its own internal text mutex).
+   *
+   * ★★★ PR-4: the name is now **escaped**. The old comment said it was
+   *   "passed through verbatim; callers are responsible ... (the server is the
+   *   source of these names so this is normally already true)".
+   *
+   *   ⚠ The server being the source is exactly the problem: a name containing a
+   *     `"` makes OUR reply malformed JSON, and the server then fails to parse
+   *     a frame it caused. The failure surfaces on the far side of the wire from
+   *     its cause. ★ A name ending in `","event":"...` can even close the frame
+   *     early and hand the server a structurally different object.
+   *     (docs/CONSTRAINTS.md A11; escaper unit-tested in tests/json_escape_test.cpp)
+   *
+   * ★ eventType is NOT escaped: it is one of three compile-time literals
+   *   ("playout" / "cleared" / …) chosen by us, never by the peer. Escaping it
+   *   would suggest it were untrusted, and that misleads the next reader. */
   void sendMarkEvent(private_t* tech_pvt, const std::string& name, const char* eventType) {
     AudioPipe* ap = static_cast<AudioPipe*>(tech_pvt->pAudioPipe);
     if (!ap) return;
     std::ostringstream json;
-    json << "{\"type\":\"mark\",\"data\":{\"name\":\"" << name
+    json << "{\"type\":\"mark\",\"data\":{\"name\":\"" << json_escape(name)
          << "\",\"event\":\"" << eventType << "\"}}";
     ap->bufferForSending(json.str().c_str());
   }
@@ -568,6 +581,13 @@ extern "C" {
       "parse_ws_uri - host %s, port %u, path %s\n", host, *pPort, path);
 
     return 1;
+  }
+
+  int fork_effective_threads(void) {
+    return (int) nServiceThreads;
+  }
+  const char* fork_effective_subprotocol(void) {
+    return mySubProtocolName;
   }
 
   switch_status_t fork_init() {

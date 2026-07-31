@@ -28,6 +28,51 @@
 
 #define MAX_METADATA_LEN (8192)
 
+/* ════════════════════════════════════════════════════════════════════════════
+ * PR-3: the module reports its own identity and capabilities
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * ★★★ Why this is load-bearing rather than a nicety:
+ *
+ *   "Is FreeSWITCH running the code I just built?" had no answer. `reload
+ *   mod_audio_fork` replies "+OK Reloading XML" and then "-ERR ... Module in
+ *   use." — the first line matched a grep in our own smoke test while the
+ *   unload had plainly failed, so a new .so sat on disk and the OLD code kept
+ *   running. A file-level sha256 proves the FILE, never the RUNNING CODE.
+ *   (Measured: the parser rejected port 99999 in its unit tests while FS logged
+ *   "port 99999" happily. Hours went into that.)
+ *
+ *   ⇒ A module that states its own version closes that question for good. The
+ *     harness currently restarts the container to be sure; that is a workaround
+ *     for the absence of this API.
+ *
+ * ── Version ──
+ *
+ * Semver, bumped by hand. ⚠ It is NOT derived from git: the .so is what gets
+ * deployed and a build from a dirty tree must not claim to be a tag.
+ * ★ deploy pins a tag (CONSTRAINTS sequence discipline ③); this string is what
+ *   you compare against that tag.
+ *
+ * ── Capability bits ──
+ *
+ * Go asks once at startup and enables features accordingly. The point is
+ * fail-fast on a too-old module rather than silently assuming:
+ *
+ *   frame_drop_metrics  mod_audio_fork::frame_dropped is emitted (PR-2)
+ *   lockfree_writes     per-context lock-free write queue (PR-5) — NOT DONE
+ *   multithread_safe    SERVICE_THREADS>1 is legal (PR-7)      — NOT DONE
+ *
+ * ★★ The last two are declared and hard-wired to 0. PR-5/6/7 were dropped from
+ *   the roadmap (S2' measured no inflection point at the 10-concurrency target),
+ *   but the BITS stay: they are the negotiation surface for the day someone
+ *   needs to scale up, and deleting them means redesigning this API then.
+ *   ⚠ Reporting 0 is the honest answer — a bit that lies is worse than absent.
+ */
+#define MOD_AUDIO_FORK_VERSION "0.2.0"
+#define CAP_FRAME_DROP_METRICS  1
+#define CAP_LOCKFREE_WRITES     0
+#define CAP_MULTITHREAD_SAFE    0
+
 typedef void (*responseHandler_t)(switch_core_session_t* session, const char* eventName, char* json);
 
 struct private_data {

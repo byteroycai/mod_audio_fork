@@ -101,6 +101,11 @@ add_executable(throttle_test tests/throttle_test.cpp)
 target_include_directories(throttle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(throttle_test PRIVATE -Wall -Wextra)
 
+# json_escape.hpp is header-only too.
+add_executable(json_escape_test tests/json_escape_test.cpp)
+target_include_directories(json_escape_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(json_escape_test PRIVATE -Wall -Wextra)
+
 set(FREESWITCH_MOD_DIR "/usr/local/freeswitch/mod"
     CACHE PATH "FreeSWITCH module install directory")
 

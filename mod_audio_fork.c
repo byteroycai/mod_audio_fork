@@ -10,6 +10,39 @@
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown);
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_audio_fork_runtime);
+/* audio_fork_version — module-level API, no session needed.
+ *
+ * ★ Deliberately a SEPARATE api rather than a `uuid_audio_fork version`
+ *   subcommand: that one requires a live session uuid, so on a fresh FS with no
+ *   calls it cannot be asked at all — and "am I running the right module?" is
+ *   exactly a startup-time question.
+ *
+ * Output is one JSON object on one line so a caller can parse it without
+ * scraping. ⚠ Not a table: `fs_cli -x` output is what Go sees, and a
+ * human-formatted table means a parser that breaks on cosmetics.
+ */
+#define VERSION_API_SYNTAX ""
+
+SWITCH_STANDARD_API(fork_version_function)
+{
+	stream->write_function(stream,
+		"{\"module\":\"mod_audio_fork\",\"version\":\"%s\","
+		"\"capabilities\":{"
+		"\"frame_drop_metrics\":%s,"
+		"\"lockfree_writes\":%s,"
+		"\"multithread_safe\":%s"
+		"},"
+		"\"service_threads\":%d,"
+		"\"subprotocol\":\"%s\"}\n",
+		MOD_AUDIO_FORK_VERSION,
+		CAP_FRAME_DROP_METRICS ? "true" : "false",
+		CAP_LOCKFREE_WRITES ? "true" : "false",
+		CAP_MULTITHREAD_SAFE ? "true" : "false",
+		fork_effective_threads(),
+		fork_effective_subprotocol());
+	return SWITCH_STATUS_SUCCESS;
+}
+
 SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load);
 
 SWITCH_MODULE_DEFINITION(mod_audio_fork, mod_audio_fork_load, mod_audio_fork_shutdown, NULL /*mod_audio_fork_runtime*/);
@@ -420,13 +453,40 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
     switch_event_reserve_subclass(EVENT_KILL_AUDIO) != SWITCH_STATUS_SUCCESS ||
     switch_event_reserve_subclass(EVENT_ERROR) != SWITCH_STATUS_SUCCESS ||
     switch_event_reserve_subclass(EVENT_DISCONNECT) != SWITCH_STATUS_SUCCESS ||
-    switch_event_reserve_subclass(EVENT_FRAME_DROPPED) != SWITCH_STATUS_SUCCESS) {
+    switch_event_reserve_subclass(EVENT_FRAME_DROPPED) != SWITCH_STATUS_SUCCESS ||
+    /* ════════════════════════════════════════════════════════════════════
+     * ★★★ PR-4: these four were DEFINED in the header and never reserved
+     * ════════════════════════════════════════════════════════════════════
+     *
+     * mod_audio_fork.h declared connect / connect_failed / buffer_overrun /
+     * json since forever, and responseHandler() fires all four — but
+     * mod_load only reserved six subclasses, so these were never registered.
+     *
+     * ⚠ The consequence is not an error anywhere. switch_event_create_subclass
+     *   on an unreserved subclass still fires; what you lose is
+     *   `/event plain CUSTOM mod_audio_fork::connect` finding it, i.e.
+     *   **a subscriber gets nothing and no side reports a problem**.
+     *   That is docs/CONSTRAINTS.md A11/A12.
+     *
+     * ★ And it mattered concretely: `internal/telephony/esl/client.go`
+     *   subscribed to only the same six, so even a fixed module would have
+     *   been talking to a deaf listener. Both sides land in this PR.
+     */
+    switch_event_reserve_subclass(EVENT_CONNECT_SUCCESS) != SWITCH_STATUS_SUCCESS ||
+    switch_event_reserve_subclass(EVENT_CONNECT_FAIL) != SWITCH_STATUS_SUCCESS ||
+    switch_event_reserve_subclass(EVENT_BUFFER_OVERRUN) != SWITCH_STATUS_SUCCESS ||
+    switch_event_reserve_subclass(EVENT_JSON) != SWITCH_STATUS_SUCCESS) {
 
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register an event subclass for mod_audio_fork API.\n");
 		return SWITCH_STATUS_TERM;
 	}
 
 	SWITCH_ADD_API(api_interface, "uuid_audio_fork", "audio_fork API", fork_function, FORK_API_SYNTAX);
+	/* PR-3: see fork_version_function. Registered even if everything else fails
+	 * to initialise — the whole point is being askable when things are wrong. */
+	SWITCH_ADD_API(api_interface, "audio_fork_version",
+		"mod_audio_fork version + capabilities (JSON)", fork_version_function, VERSION_API_SYNTAX);
+	switch_console_set_complete("add audio_fork_version");
 	switch_console_set_complete("add uuid_audio_fork start wss-url metadata");
 	switch_console_set_complete("add uuid_audio_fork start wss-url");
 	switch_console_set_complete("add uuid_audio_fork stop");
@@ -454,6 +514,13 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown)
 	switch_event_free_subclass(EVENT_DISCONNECT);
 	switch_event_free_subclass(EVENT_ERROR);
 	switch_event_free_subclass(EVENT_FRAME_DROPPED);
+	/* ★ 必须与 reserve 一一对应：漏 free 的症状是**在同一个进程里 reload 之后
+	 *   load 失败**（"module load file routine returned an error"），而那个报错
+	 *   不提事件子类。⚠ 实测撞到过一次，当时以为是 .so 坏了。 */
+	switch_event_free_subclass(EVENT_CONNECT_SUCCESS);
+	switch_event_free_subclass(EVENT_CONNECT_FAIL);
+	switch_event_free_subclass(EVENT_BUFFER_OVERRUN);
+	switch_event_free_subclass(EVENT_JSON);
 
 	return SWITCH_STATUS_SUCCESS;
 }
